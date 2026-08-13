@@ -521,48 +521,115 @@ def choose_time_line(time_lines: list, action: str):
     return sel["time"], sel["line"]
 
 
-def extract_surname_from_text(text: str, user_id: int | None = None):
-    # 1. Search text for any registered surname/login first
+def get_known_employee_names() -> dict[str, str]:
+    """Returns a map of normalized names (lower) to canonical names from roles and database."""
+    name_map = {}
     roles = load_roles()
     for role_name in ("admin", "user"):
-        for reg_s in roles.get(role_name, {}).keys():
-            clean_s = reg_s.split('.')[0]
-            if len(clean_s) >= 3 and clean_s.lower() in text.lower():
-                return reg_s
+        for s in roles.get(role_name, {}).keys():
+            name_map[s.strip().lower()] = s.strip()
+            prefix = s.split('.')[0].strip().lower()
+            if len(prefix) >= 3:
+                name_map[prefix] = s.strip()
+    
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT DISTINCT surname FROM shift_records WHERE surname IS NOT NULL AND surname != ''")
+            for row in cursor.fetchall():
+                s = row["surname"].strip()
+                if s.lower() not in name_map:
+                    name_map[s.lower()] = s
+                    prefix = s.split('.')[0].strip().lower()
+                    if len(prefix) >= 3 and prefix not in name_map:
+                        name_map[prefix] = s
+    except Exception as e:
+        logger.error(f"Error fetching known employee names: {e}")
+    return name_map
 
-    # 2. Match RMAS Mobile header login pattern (e.g. "ivanov.a C941s" or "petrov.s C941s")
+
+def extract_and_verify_surname(text: str, user_id: int | None = None) -> tuple[str, str]:
+    """
+    Extracts employee surname/login from OCR text, validates it against the DB / registered roles,
+    and if unrecognized, missing, or mismatched, performs a dedicated check and fallback to Telegram ID.
+
+    Returns:
+        (selected_surname, resolution_source)
+        where resolution_source is:
+        - 'ocr_verified': matched registered employee directly on screenshot
+        - 'telegram_id_fallback': name on screenshot missing or not in DB, matched by Telegram ID
+        - 'unregistered_ocr': candidate found on screen, but user not registered in DB
+        - 'unknown': neither OCR nor Telegram ID matched
+    """
+    known_names = get_known_employee_names()
+    registered_surname_for_sender = get_surname_for_user(user_id) if user_id else None
+
+    # 1. Search text for any registered surname/login from DB or roles
+    for norm_name, canonical_name in known_names.items():
+        if len(norm_name) >= 3 and norm_name in text.lower():
+            return canonical_name, "ocr_verified"
+
+    # 2. Match RMAS Mobile header login pattern (e.g. "eremin.n C941s")
     rmas_match = re.search(r"RMAS\s+Mobile[^\n]*\n\s*([a-zA-Z0-9_\.\-]+)", text, re.IGNORECASE)
     if rmas_match:
-        found_login = rmas_match.group(1).strip()
-        if len(found_login) >= 3 and found_login.lower() not in {"mobile", "check", "grade", "in", "out"}:
-            return found_login
+        cand = rmas_match.group(1).strip()
+        cand_lower = cand.lower()
+        if len(cand) >= 3 and cand_lower not in {"mobile", "check", "grade", "in", "out", "str", "m.video"}:
+            if cand_lower in known_names or cand_lower.split('.')[0] in known_names:
+                canonical = known_names.get(cand_lower) or known_names.get(cand_lower.split('.')[0]) or cand
+                return canonical, "ocr_verified"
+            # Candidate on screenshot does NOT match any DB employee -> check Telegram ID
+            if registered_surname_for_sender:
+                log_audit_event(
+                    "WARNING",
+                    "OCR_NAME_MISMATCH",
+                    f"OCR extracted '{cand}', which is not in DB. Fallback to Telegram ID {user_id} -> '{registered_surname_for_sender}'",
+                    user_id=user_id
+                )
+                return registered_surname_for_sender, "telegram_id_fallback"
+            return cand, "unregistered_ocr"
 
-    # 3. Match login pattern like surname.i or username handle
+    # 3. Match login pattern like surname.i
     m = SURNAME_LOGIN_PATTERN.search(text)
     if m:
-        return m.group(1)
+        cand = m.group(1).strip()
+        cand_lower = cand.lower()
+        if cand_lower not in {"str.khalturina", "m.video", "rmas.mobile"} and len(cand) >= 3:
+            if cand_lower in known_names or cand_lower.split('.')[0] in known_names:
+                canonical = known_names.get(cand_lower) or known_names.get(cand_lower.split('.')[0]) or cand
+                return canonical, "ocr_verified"
+            if registered_surname_for_sender:
+                log_audit_event(
+                    "WARNING",
+                    "OCR_NAME_MISMATCH",
+                    f"OCR matched '{cand}', not in DB. Fallback to Telegram ID {user_id} -> '{registered_surname_for_sender}'",
+                    user_id=user_id
+                )
+                return registered_surname_for_sender, "telegram_id_fallback"
 
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    for line in lines[:8]:
-        candidates = [w for w in SURNAME_WORD_PATTERN.findall(line) if w not in SKIP_WORDS and not w.isupper()]
-        if candidates:
-            return candidates[0]
+    # 4. Fallback check by Telegram User ID if name was not recognized on screenshot
+    if registered_surname_for_sender:
+        log_audit_event(
+            "INFO",
+            "OCR_NAME_FALLBACK_TG_ID",
+            f"No recognizable employee name on screenshot. Assigned to Telegram ID {user_id} -> '{registered_surname_for_sender}'",
+            user_id=user_id
+        )
+        return registered_surname_for_sender, "telegram_id_fallback"
 
-    # 4. Fallback to sender's registered surname ONLY if no username was found in screenshot text
     if user_id:
-        reg_s = get_surname_for_user(user_id)
-        if reg_s:
-            return reg_s
-
-    return None
+        return f"User_{user_id}", "unknown"
+    return "Unknown", "unknown"
 
 
 def parse_text(time_lines: list, full_text: str, action: str, user_id: int | None = None) -> dict:
     t, tl = choose_time_line(time_lines, action)
+    surname, resolution_source = extract_and_verify_surname(full_text, user_id)
     return {
         "time": t,
         "time_line": tl,
-        "surname": extract_surname_from_text(full_text, user_id),
+        "surname": surname,
+        "resolution_source": resolution_source,
         "time_lines": time_lines,
         "raw_text": full_text.strip()
     }
@@ -1005,6 +1072,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     final_surname = parsed.get("surname") or get_surname_for_user(user_id) or f"User_{user_id}"
+    resolution_source = parsed.get("resolution_source", "unknown")
 
     record = {
         "chat_id": update.effective_chat.id,
@@ -1020,13 +1088,19 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if save_shift_record_to_db(record):
         action_label = "🟢 Приход" if action == "in" else "🔴 Уход"
-        await update.message.reply_text(
+        msg_text = (
             f"✅ Запись успешно зафиксирована и сохранена в БД!\n\n"
             f"📌 Тип: {action_label}\n"
             f"👤 ФИО / Логин: {record['surname']}\n"
             f"⏰ Время: {record['time']}\n"
             f"🗓 Дата: {record['created_at']}"
         )
+        if resolution_source == "telegram_id_fallback":
+            msg_text += (
+                "\n\nℹ️ *Примечание:* Имя на скриншоте не распознано или не найдено в БД, "
+                "поэтому отметка автоматически привязана к вашему профилю по Telegram ID."
+            )
+        await update.message.reply_text(msg_text, parse_mode="Markdown")
     else:
         await update.message.reply_text("❌ Ошибка при сохранении записи в базу данных.")
 
@@ -1039,6 +1113,19 @@ def get_surname_for_user(user_id: int):
         for surname, uid in roles.get(role_name, {}).items():
             if uid == user_id:
                 return surname
+    # Also check previous history in SQLite DB
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT surname FROM shift_records WHERE telegram_user_id = ? AND surname IS NOT NULL AND surname NOT LIKE 'User_%' ORDER BY id DESC LIMIT 1",
+                (user_id,)
+            )
+            row = cursor.fetchone()
+            if row and row["surname"]:
+                return row["surname"]
+    except Exception as e:
+        logger.error(f"Error finding surname in DB history for tg_id {user_id}: {e}")
     return None
 
 
