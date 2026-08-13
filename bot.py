@@ -524,11 +524,17 @@ def choose_time_line(time_lines: list, action: str):
                 valid_items.append((sec_val, it))
 
     if valid_items:
-        if action == "in":
-            # For Check In: earliest timestamp
+        # Prioritize matching detected color first (green for in, red for out)
+        target_color = "green" if action == "in" else "red"
+        color_matched = [item for item in valid_items if item[1].get("color") == target_color]
+        
+        if color_matched:
+            sel = color_matched[0]
+        elif action == "in":
+            # For Check In fallback: earliest timestamp
             sel = min(valid_items, key=lambda x: x[0])
         else:
-            # For Check Out: latest timestamp (highest time value)
+            # For Check Out fallback: latest timestamp
             sel = max(valid_items, key=lambda x: x[0])
 
         total = sel[0]
