@@ -200,6 +200,34 @@ export default function App() {
     }
   };
 
+  const handleBatchDeleteRecords = async (ids: number[]) => {
+    try {
+      const res = await apiFetch('/api/records/batch-delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids }),
+      });
+      if (res.ok) {
+        fetchData();
+      }
+    } catch (e) {
+      console.error('Error batch deleting records:', e);
+    }
+  };
+
+  const handleClearAllRecords = async () => {
+    try {
+      const res = await apiFetch('/api/records/clear', {
+        method: 'POST',
+      });
+      if (res.ok) {
+        fetchData();
+      }
+    } catch (e) {
+      console.error('Error clearing all records:', e);
+    }
+  };
+
   const handleUpdateRole = async (surname: string, role: string, telegram_id: number) => {
     const res = await apiFetch('/api/roles', {
       method: 'POST',
@@ -280,6 +308,8 @@ export default function App() {
                 onRefresh={fetchData}
                 onOpenAddModal={() => setIsAddModalOpen(true)}
                 onDeleteRecord={handleDeleteRecord}
+                onBatchDeleteRecords={handleBatchDeleteRecords}
+                onClearAllRecords={handleClearAllRecords}
               />
             )}
 

@@ -185,10 +185,37 @@ def log_audit_event(level: str, event_type: str, message: str, user_id: int | No
     except Exception as e:
         logger.error(f"Failed to insert log event into SQLite: {e}")
 
+def sync_json_to_db():
+    """Prune any shift records from SQLite that were deleted via the Web UI"""
+    if not os.path.exists(DATA_FILE):
+        return
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        json_records = data.get("records", [])
+        valid_ids = {int(r["id"]) for r in json_records if r.get("id") is not None}
+        
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM shift_records")
+            db_ids = {row["id"] for row in cursor.fetchall()}
+            
+            ids_to_delete = db_ids - valid_ids
+            if ids_to_delete:
+                logger.info(f"Removing {len(ids_to_delete)} records from SQLite that were deleted via Web UI: {ids_to_delete}")
+                cursor.executemany("DELETE FROM shift_records WHERE id = ?", [(i,) for i in ids_to_delete])
+                conn.commit()
+    except Exception as e:
+        logger.error(f"Error syncing JSON deletions to DB: {e}")
+
 def save_shift_record_to_db(record: dict):
     try:
+        # First ensure any deletions from web interface are purged from DB
+        sync_json_to_db()
+
         with get_db_connection() as conn:
-            conn.cursor().execute(
+            cursor = conn.cursor()
+            cursor.execute(
                 """INSERT INTO shift_records 
                    (chat_id, telegram_user_id, action, surname, time, time_line, raw_text, source, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -205,6 +232,8 @@ def save_shift_record_to_db(record: dict):
                 )
             )
             conn.commit()
+            record_id = cursor.lastrowid
+
         action_label = str(record.get('action') or 'in').upper()
         surname_label = str(record.get('surname') or 'Unknown')
         time_label = str(record.get('time') or '')
@@ -220,6 +249,7 @@ def save_shift_record_to_db(record: dict):
 
 def sync_db_to_json():
     try:
+        sync_json_to_db()
         with get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM shift_records ORDER BY id ASC")
@@ -343,42 +373,45 @@ def preprocess_image(image: Image.Image) -> Image.Image:
 
 def get_time_color(img_rgb: Image.Image, left: int, top: int, width: int, height: int) -> str:
     try:
-        # Expand box slightly to catch nearby icons or colored text borders
-        expand = int(height * 0.5)
-        l = max(0, left - expand)
-        t = max(0, top - expand)
-        r = min(img_rgb.width, left + width + expand)
-        b = min(img_rgb.height, top + height + expand)
+        # Ignore top status bar entirely (first 7% of screen height)
+        if top < img_rgb.height * 0.07:
+            return "status_bar"
+
+        # Crop the exact region around the text
+        pad_x = max(6, int(width * 0.15))
+        pad_y = max(4, int(height * 0.2))
+        l = max(0, left - pad_x)
+        t = max(0, top - pad_y)
+        r = min(img_rgb.width, left + width + pad_x)
+        b = min(img_rgb.height, top + height + pad_y)
         
         box = img_rgb.crop((l, t, r, b))
-        hsv_box = box.convert("HSV")
         
-        # In HSV (PIL): H (0-255), S (0-255), V (0-255)
-        # Green hue: ~85 (range 40-110)
-        # Red hue: ~0 or ~255 (range 0-20 or 230-255)
         green_pixels = 0
         red_pixels = 0
-        total_colored = 0
+        total_pixels = 0
         
-        for pixel in hsv_box.getdata():
-            h, s, v = pixel
-            if s > 40 and v > 40:  # Not white, black, or gray
-                total_colored += 1
-                if 40 <= h <= 110:
-                    green_pixels += 1
-                elif h <= 20 or h >= 230:
-                    red_pixels += 1
-                    
-        if total_colored > 0:
-            if green_pixels > red_pixels and green_pixels > total_colored * 0.2:
-                return "green"
-            if red_pixels > green_pixels and red_pixels > total_colored * 0.2:
-                return "red"
+        rgb_data = list(box.getdata())
+        
+        for pixel in rgb_data:
+            r_val, g_val, b_val = pixel[:3]
+            total_pixels += 1
+            
+            # Bright Green text detection (e.g., #22c55e / #16a34a / #00c853)
+            if g_val >= 90 and g_val > r_val + 25 and g_val > b_val + 20:
+                green_pixels += 1
+            # Bright Red / Crimson text detection (e.g., #ef4444 / #dc2626 / #d50000)
+            elif r_val >= 110 and r_val > g_val + 35 and r_val > b_val + 30:
+                red_pixels += 1
+                
+        if green_pixels >= 4 and green_pixels > red_pixels * 1.5:
+            return "green"
+        if red_pixels >= 4 and red_pixels > green_pixels * 1.5:
+            return "red"
         return "unknown"
     except Exception as e:
         logger.error(f"Color extraction error: {e}")
         return "unknown"
-
 
 
 def run_tesseract(image: Image.Image) -> str:
@@ -415,7 +448,7 @@ def extract_time_lines(raw_text: str, ocr_data: dict = None, img_rgb: Image.Imag
                     ocr_data['width'][i], 
                     ocr_data['height'][i]
                 )
-                word_colors.append({"text": text, "color": color})
+                word_colors.append({"text": text, "color": color, "left": ocr_data['left'][i], "top": ocr_data['top'][i]})
 
     for idx, l in enumerate(lines):
         matches = re.findall(TIME_PATTERN, l)
@@ -433,6 +466,14 @@ def extract_time_lines(raw_text: str, ocr_data: dict = None, img_rgb: Image.Imag
                 if m in wc["text"] or wc["text"] in m:
                     color = wc["color"]
                     break
+            
+            # Contextual keywords in line
+            low_l = l.lower()
+            if color == "unknown":
+                if any(k in low_l for k in ("check in", "приход", "вход", "старт", "начало")):
+                    color = "green"
+                elif any(k in low_l for k in ("check out", "уход", "выход", "финиш", "конец")):
+                    color = "red"
                     
             results.append({"time": norm, "line": l, "line_index": idx, "color": color})
     return results
@@ -473,22 +514,16 @@ def choose_time_line(time_lines: list, action: str):
         parsed.append((total, it))
         
     if parsed:
-        # Prefer full HH:MM:SS timestamps over HH:MM if available
-        full_sec = [p for p in parsed if len(p[1]["time"].split(":")) == 3]
-        target = full_sec if full_sec else parsed
-        
-        # Color based selection
         expected_color = "green" if action == "in" else "red"
-        color_matches = [p for p in target if p[1].get("color") == expected_color]
+        color_matches = [p for p in parsed if p[1].get("color") == expected_color]
         
-        if color_matches:
-            target = color_matches
+        target = color_matches if color_matches else parsed
             
         if action == "in":
-            # For Check In (Приход), prefer topmost/earliest if multiple match
+            # For Check In (Приход): take earliest / green match
             sel = min(target, key=lambda x: (x[1].get("line_index", 0), x[0]))
         else:
-            # For Check Out (Уход), prefer bottommost/latest if multiple match
+            # For Check Out (Уход): take latest / red match
             sel = max(target, key=lambda x: (x[1].get("line_index", 0), x[0]))
             
         total = sel[0]
@@ -931,33 +966,43 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     time_lines = extract_time_lines(raw_text, ocr_data, img_rgb)
 
-    # Automatic Action Determination based on Green vs Red Color Logic
-    action = None
+    # Automatic Action Determination based on Green vs Red Color Logic:
+    # 1. Both Green and Red present -> "out" (Уход), choose red timestamp
+    # 2. Only Red present -> "out" (Уход), choose red timestamp
+    # 3. Only Green present -> "in" (Приход), choose green timestamp
     has_red_time = any(tl.get("color") == "red" for tl in time_lines)
     has_green_time = any(tl.get("color") == "green" for tl in time_lines)
 
-    lower_text = raw_text.lower()
-    if has_red_time or "check out" in lower_text or "уход" in lower_text:
+    if has_red_time:
         action = "out"
-    elif has_green_time or "check in" in lower_text or "приход" in lower_text:
+    elif has_green_time:
         action = "in"
-
-    if not action:
-        today = get_current_time().date().isoformat()
-        try:
-            with get_db_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT action FROM shift_records WHERE telegram_user_id = ? AND created_at LIKE ? ORDER BY created_at DESC LIMIT 1",
-                    (user_id, f"{today}%")
-                )
-                last_record = cursor.fetchone()
-                if last_record and last_record["action"] == "in":
-                    action = "out"
-                else:
-                    action = "in"
-        except Exception:
+    else:
+        lower_text = raw_text.lower()
+        if any(k in lower_text for k in ("check out", "уход", "выход", "финиш", "завершить")):
+            action = "out"
+        elif any(k in lower_text for k in ("check in", "приход", "вход", "старт", "начать")):
             action = "in"
+        else:
+            valid_times = [tl for tl in time_lines if not looks_like_status_bar(tl["line"])]
+            if len(valid_times) >= 2:
+                action = "out"
+            else:
+                today = get_current_time().date().isoformat()
+                try:
+                    with get_db_connection() as conn:
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            "SELECT action FROM shift_records WHERE telegram_user_id = ? AND created_at LIKE ? ORDER BY id DESC LIMIT 1",
+                            (user_id, f"{today}%")
+                        )
+                        last_record = cursor.fetchone()
+                        if last_record and last_record["action"] == "in":
+                            action = "out"
+                        else:
+                            action = "in"
+                except Exception:
+                    action = "in"
 
     parsed = parse_text(time_lines, raw_text, action, user_id)
     time_value = parsed.get("time")

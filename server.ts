@@ -2,6 +2,7 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import crypto from "crypto";
+import child_process from "child_process";
 import dotenv from "dotenv";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
@@ -502,15 +503,84 @@ app.delete("/api/records/:id", (req, res) => {
     } catch (e) {
       console.error("Failed deleting record from DB:", e);
     }
+  } else {
+    // Fallback on Node < 22 without node:sqlite: execute python sqlite3 command to delete from shift_attendance.db
+    try {
+      child_process.execSync(
+        `python3 -c "import sqlite3; conn = sqlite3.connect('${DB_FILE}'); conn.execute('DELETE FROM shift_records WHERE id=?', (${recordId},)); conn.commit(); conn.close()"`,
+        { stdio: "ignore" }
+      );
+    } catch (e) {
+      console.error("Python sqlite fallback delete error:", e);
+    }
   }
 
   let records = readShiftRecords();
-  const initialCount = records.length;
   records = records.filter((r: any) => Number(r.id) !== recordId);
 
   writeShiftRecords(records);
   addLogEntry("WARNING", `RECORD_DELETED: Removed shift record ID ${recordId}`);
   res.json({ success: true });
+});
+
+// Clear All Shift Records (Batch Wipe for testing/cleanup)
+app.post("/api/records/clear", (req, res) => {
+  const db = getDb();
+  if (db) {
+    try {
+      db.prepare("DELETE FROM shift_records").run();
+    } catch (e) {
+      console.error("Failed clearing DB records:", e);
+    }
+  } else {
+    try {
+      child_process.execSync(
+        `python3 -c "import sqlite3; conn = sqlite3.connect('${DB_FILE}'); conn.execute('DELETE FROM shift_records'); conn.commit(); conn.close()"`,
+        { stdio: "ignore" }
+      );
+    } catch (e) {
+      console.error("Python sqlite clear error:", e);
+    }
+  }
+
+  writeShiftRecords([]);
+  addLogEntry("WARNING", "RECORDS_CLEARED: All shift records were wiped from database by admin.");
+  res.json({ success: true, count: 0 });
+});
+
+// Batch Delete Specific Shift Records
+app.post("/api/records/batch-delete", (req, res) => {
+  const { ids } = req.body;
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return res.status(400).json({ error: "Array of ids is required" });
+  }
+
+  const idSet = new Set(ids.map(Number));
+  const db = getDb();
+  if (db) {
+    try {
+      const placeholders = ids.map(() => "?").join(",");
+      db.prepare(`DELETE FROM shift_records WHERE id IN (${placeholders})`).run(...ids.map(Number));
+    } catch (e) {
+      console.error("Failed batch deleting from DB:", e);
+    }
+  } else {
+    try {
+      const idsStr = ids.map(Number).join(",");
+      child_process.execSync(
+        `python3 -c "import sqlite3; conn = sqlite3.connect('${DB_FILE}'); conn.execute('DELETE FROM shift_records WHERE id IN (${idsStr})'); conn.commit(); conn.close()"`,
+        { stdio: "ignore" }
+      );
+    } catch (e) {
+      console.error("Python sqlite batch delete error:", e);
+    }
+  }
+
+  let records = readShiftRecords();
+  records = records.filter((r: any) => !idSet.has(Number(r.id)));
+  writeShiftRecords(records);
+  addLogEntry("WARNING", `BATCH_RECORDS_DELETED: Deleted ${ids.length} records.`);
+  res.json({ success: true, deletedCount: ids.length });
 });
 
 // Get System Audit Logs
@@ -836,34 +906,32 @@ app.post("/api/ocr/analyze", async (req, res) => {
     // Clean base64 string
     const cleanBase64 = imageBase64.replace(/^data:image\/\w+;base64,/, "");
 
-    const prompt = `You are an expert OCR system for employee shift attendance screenshots (e.g. RMAS Mobile, WorkTime, Grade app screenshots).
+    const prompt = `You are an expert OCR and image analysis system for employee shift attendance screenshots from the RMAS Mobile application and similar attendance systems.
 Analyze this mobile screenshot image carefully and extract the following structured data:
 
-COLOR-BASED RECOGNITION RULES:
-- GREEN TIME / GREEN TEXT / GREEN BADGE: Record as Check In ('detected_action': 'in'). Extract the green timestamp as 'time'.
-- RED TIME / RED TEXT / RED BADGE: Record as Check Out ('detected_action': 'out'). If there is RED time present on the screenshot, consider ONLY the red time as 'time' and set 'detected_action': 'out'.
-
-1. 'surname': Look for employee full name, surname, or username handle (e.g., "ivanov.a", "petrov.s", "Иванов.А.В", "Petrov.S"). In RMAS Mobile app screenshots, the username handle is displayed directly under the header 'RMAS Mobile...' (e.g., "ivanov.a C941s" -> extract "ivanov.a"). Ignore generic terms like "RMAS", "Mobile", "Grade", "Check In", "Check Out", "SDI".
-2. 'time': Extract the check-in or check-out timestamp in HH:MM:SS format (e.g. "08:30:15"). If red time exists, extract the RED time as 'time'. Avoid status bar clock at the very top (battery/wifi/AM/PM bar).
-3. 'time_line': The exact line or phrase containing the shift timestamp.
-4. 'status_bar_detected': Boolean true if top status bar clock was filtered out.
-5. 'detected_action': "in" if green time / Check In, or "out" if red time / Check Out.
-6. 'confidence': A score between 0.0 and 1.0.
-7. 'raw_text': A clean multi-line transcript of key visible text.
+RMAS MOBILE APP SPECIFICS & COLOR RULES:
+1. Employee Username: In RMAS Mobile screenshots, look at the top blue header. Right below the "RMAS Mobile ..." title, there is the username line (e.g., "eremin.n C941s" -> extract "eremin.n"). Extract this username handle as 'surname'.
+2. Status Bar Clock: At the very top edge of the phone screen (black bar with battery/wifi icon, e.g. "11:28" or "20:34"), ignore this clock.
+3. Check In (Приход):
+   - Indicated by GREEN timestamp text (e.g., "11:28:53" with distance "96 m" underneath) located above the buttons.
+   - If ONLY green timestamp is present (no red timestamp below the buttons), the action is Check In ('detected_action': 'in') and the shift time is this green timestamp (e.g., "11:28:53").
+4. Check Out (Уход):
+   - Indicated by RED timestamp text (e.g., "20:34:25" with distance "7 m" underneath) located below the "Check Out" button.
+   - When BOTH green time ("11:28:53") and red time ("20:34:25") are present on the screenshot, the shift action is definitively Check Out ('detected_action': 'out'), and 'time' MUST be the RED timestamp ("20:34:25").
 
 Return strictly valid JSON matching this exact structure:
 {
-  "surname": "string or null",
-  "time": "HH:MM:SS or null",
+  "surname": "string or null (e.g. eremin.n)",
+  "time": "HH:MM:SS format (e.g. 11:28:53 or 20:34:25)",
   "time_line": "string or null",
-  "status_bar_detected": true/false,
+  "status_bar_detected": true,
   "detected_action": "in" or "out",
-  "confidence": 0.95,
+  "confidence": 0.98,
   "raw_text": "string"
 }`;
 
     const response = await ai.models.generateContent({
-      model: "gemini-3.6-flash",
+      model: "gemini-2.5-flash",
       contents: [
         {
           inlineData: {
