@@ -479,9 +479,11 @@ def extract_time_lines(raw_text: str, ocr_data: dict = None, img_rgb: Image.Imag
     return results
 
 
-def looks_like_status_bar(line: str) -> bool:
+def looks_like_status_bar(line: str, line_index: int = 0) -> bool:
     low = line.lower()
-    return any(k in low for k in ("battery", "wifi", "lte", "5g", "4g", "%", "volte"))
+    if line_index == 0:
+        return True
+    return any(k in low for k in ("battery", "wifi", "lte", "5g", "4g", "%", "volte", "sim"))
 
 
 def choose_time_line(time_lines: list, action: str):
@@ -489,9 +491,7 @@ def choose_time_line(time_lines: list, action: str):
         now_str = get_current_time().strftime("%H:%M:%S")
         return now_str, f"Fallback Time: {now_str}"
 
-    def parse_to_seconds(ts: str, line: str):
-        if looks_like_status_bar(line):
-            return None
+    def parse_to_seconds(ts: str):
         m = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$", ts)
         if not m:
             return None
@@ -503,35 +503,40 @@ def choose_time_line(time_lines: list, action: str):
         except Exception:
             return None
 
-    filtered = [it for it in time_lines if not looks_like_status_bar(it["line"])]
-    candidates = filtered if filtered else time_lines
-    
-    parsed = []
-    for it in candidates:
-        total = parse_to_seconds(it["time"], it.get("line", ""))
-        if total is None:
+    # Filter out status bar lines and filter out 2-part HH:MM if 3-part HH:MM:SS exists
+    valid_items = []
+    has_seconds = any(len(it["time"].split(":")) == 3 and not looks_like_status_bar(it.get("line", ""), it.get("line_index", 0)) for it in time_lines)
+
+    for it in time_lines:
+        if looks_like_status_bar(it.get("line", ""), it.get("line_index", 0)):
             continue
-        parsed.append((total, it))
-        
-    if parsed:
-        expected_color = "green" if action == "in" else "red"
-        color_matches = [p for p in parsed if p[1].get("color") == expected_color]
-        
-        target = color_matches if color_matches else parsed
-            
+        if has_seconds and len(it["time"].split(":")) < 3:
+            continue
+        sec_val = parse_to_seconds(it["time"])
+        if sec_val is not None:
+            valid_items.append((sec_val, it))
+
+    if not valid_items:
+        # Fallback to all items if filtered became empty
+        for it in time_lines:
+            sec_val = parse_to_seconds(it["time"])
+            if sec_val is not None:
+                valid_items.append((sec_val, it))
+
+    if valid_items:
         if action == "in":
-            # For Check In (Приход): take earliest / green match
-            sel = min(target, key=lambda x: (x[1].get("line_index", 0), x[0]))
+            # For Check In: earliest timestamp
+            sel = min(valid_items, key=lambda x: x[0])
         else:
-            # For Check Out (Уход): take latest / red match
-            sel = max(target, key=lambda x: (x[1].get("line_index", 0), x[0]))
-            
+            # For Check Out: latest timestamp (highest time value)
+            sel = max(valid_items, key=lambda x: x[0])
+
         total = sel[0]
         h = total // 3600
         mm = (total % 3600) // 60
         ss = total % 60
         return f"{h:02}:{mm:02}:{ss:02}", sel[1]["line"]
-        
+
     sel = time_lines[-1]
     return sel["time"], sel["line"]
 
@@ -966,16 +971,25 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     time_lines = extract_time_lines(raw_text, ocr_data, img_rgb)
 
-    # Automatic Action Determination based on Green vs Red Color Logic:
-    # 1. Both Green and Red present -> "out" (Уход), choose red timestamp
-    # 2. Only Red present -> "out" (Уход), choose red timestamp
-    # 3. Only Green present -> "in" (Приход), choose green timestamp
-    has_red_time = any(tl.get("color") == "red" for tl in time_lines)
-    has_green_time = any(tl.get("color") == "green" for tl in time_lines)
+    # Count valid shift timestamps (excluding top phone status bar)
+    has_seconds = any(len(tl["time"].split(":")) == 3 and not looks_like_status_bar(tl.get("line", ""), tl.get("line_index", 0)) for tl in time_lines)
+    
+    valid_shift_times = []
+    for tl in time_lines:
+        if looks_like_status_bar(tl.get("line", ""), tl.get("line_index", 0)):
+            continue
+        if has_seconds and len(tl["time"].split(":")) < 3:
+            continue
+        valid_shift_times.append(tl["time"])
 
-    if has_red_time:
+    distinct_times = list(dict.fromkeys(valid_shift_times))
+
+    # Simplified Rule:
+    # 1 timestamp on screenshot -> Check In ("in")
+    # 2 or more timestamps on screenshot -> Check Out ("out", will pick the latest/maximum time)
+    if len(distinct_times) >= 2:
         action = "out"
-    elif has_green_time:
+    elif len(distinct_times) == 1:
         action = "in"
     else:
         lower_text = raw_text.lower()
@@ -984,25 +998,21 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif any(k in lower_text for k in ("check in", "приход", "вход", "старт", "начать")):
             action = "in"
         else:
-            valid_times = [tl for tl in time_lines if not looks_like_status_bar(tl["line"])]
-            if len(valid_times) >= 2:
-                action = "out"
-            else:
-                today = get_current_time().date().isoformat()
-                try:
-                    with get_db_connection() as conn:
-                        cursor = conn.cursor()
-                        cursor.execute(
-                            "SELECT action FROM shift_records WHERE telegram_user_id = ? AND created_at LIKE ? ORDER BY id DESC LIMIT 1",
-                            (user_id, f"{today}%")
-                        )
-                        last_record = cursor.fetchone()
-                        if last_record and last_record["action"] == "in":
-                            action = "out"
-                        else:
-                            action = "in"
-                except Exception:
-                    action = "in"
+            today = get_current_time().date().isoformat()
+            try:
+                with get_db_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT action FROM shift_records WHERE telegram_user_id = ? AND created_at LIKE ? ORDER BY id DESC LIMIT 1",
+                        (user_id, f"{today}%")
+                    )
+                    last_record = cursor.fetchone()
+                    if last_record and last_record["action"] == "in":
+                        action = "out"
+                    else:
+                        action = "in"
+            except Exception:
+                action = "in"
 
     parsed = parse_text(time_lines, raw_text, action, user_id)
     time_value = parsed.get("time")
