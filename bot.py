@@ -185,34 +185,21 @@ def log_audit_event(level: str, event_type: str, message: str, user_id: int | No
     except Exception as e:
         logger.error(f"Failed to insert log event into SQLite: {e}")
 
-def sync_json_to_db():
-    """Prune any shift records from SQLite that were deleted via the Web UI"""
-    if not os.path.exists(DATA_FILE):
-        return
+def sync_db_to_json():
+    """Sync all SQLite shift records to JSON file"""
     try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        json_records = data.get("records", [])
-        valid_ids = {int(r["id"]) for r in json_records if r.get("id") is not None}
-        
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT id FROM shift_records")
-            db_ids = {row["id"] for row in cursor.fetchall()}
+            cursor.execute("SELECT * FROM shift_records ORDER BY id ASC")
+            rows = cursor.fetchall()
+            records = [dict(r) for r in rows]
             
-            ids_to_delete = db_ids - valid_ids
-            if ids_to_delete:
-                logger.info(f"Removing {len(ids_to_delete)} records from SQLite that were deleted via Web UI: {ids_to_delete}")
-                cursor.executemany("DELETE FROM shift_records WHERE id = ?", [(i,) for i in ids_to_delete])
-                conn.commit()
+        atomic_save_file(DATA_FILE, {"records": records, "updated_at": get_current_time().isoformat()})
     except Exception as e:
-        logger.error(f"Error syncing JSON deletions to DB: {e}")
+        logger.error(f"Sync to JSON failed: {e}")
 
 def save_shift_record_to_db(record: dict):
     try:
-        # First ensure any deletions from web interface are purged from DB
-        sync_json_to_db()
-
         with get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -238,7 +225,7 @@ def save_shift_record_to_db(record: dict):
         surname_label = str(record.get('surname') or 'Unknown')
         time_label = str(record.get('time') or '')
         uid = record.get("telegram_user_id")
-        log_audit_event("INFO", "DB_RECORD_SAVED", f"Recorded {action_label} for {surname_label} at {time_label}", user_id=uid if isinstance(uid, int) else None)
+        log_audit_event("INFO", "DB_RECORD_SAVED", f"Recorded {action_label} for {surname_label} at {time_label} (ID: {record_id})", user_id=uid if isinstance(uid, int) else None)
         
         sync_db_to_json()
         return True
@@ -246,19 +233,6 @@ def save_shift_record_to_db(record: dict):
         uid = record.get("telegram_user_id")
         log_audit_event("ERROR", "DB_RECORD_SAVE_FAILED", f"Error saving shift record: {e}", user_id=uid if isinstance(uid, int) else None)
         return False
-
-def sync_db_to_json():
-    try:
-        sync_json_to_db()
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM shift_records ORDER BY id ASC")
-            rows = cursor.fetchall()
-            records = [dict(r) for r in rows]
-            
-        atomic_save_file(DATA_FILE, {"records": records, "updated_at": get_current_time().isoformat()})
-    except Exception as e:
-        logger.error(f"Sync to JSON failed: {e}")
 
 def atomic_save_file(file_path: str, data: dict):
     dir_name = os.path.dirname(os.path.abspath(file_path))
