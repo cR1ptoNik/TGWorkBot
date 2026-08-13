@@ -1,0 +1,8 @@
+{
+  "name": "Attendance & Telegram Bot Management System",
+  "description": "Система учета рабочего времени сотрудников, синхронизация с Telegram-ботом, распознавание фото (OCR), расписание смен и аудит.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

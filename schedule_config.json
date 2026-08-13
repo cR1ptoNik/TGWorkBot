@@ -1,0 +1,8 @@
+{
+  "shift_start": "09:00",
+  "shift_end": "18:00",
+  "tz_offset_hours": 3,
+  "remind_before_start_minutes": 5,
+  "remind_after_end_minutes": 5,
+  "enabled": true
+}
