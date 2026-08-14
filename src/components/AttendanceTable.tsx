@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
-import { Search, Plus, Trash2, Download, LogIn, LogOut, AlertCircle, RefreshCw, CheckSquare, Square } from 'lucide-react';
+import { Search, Plus, Trash2, Download, LogIn, LogOut, AlertCircle, RefreshCw, CheckSquare, Square, Calendar, Clock, AlertTriangle, CheckCircle2 } from 'lucide-react';
 import { ShiftRecord } from '../types';
+import { triggerHaptic } from '../lib/api';
 
 interface AttendanceTableProps {
   records: ShiftRecord[];
@@ -23,20 +24,46 @@ export const AttendanceTable: React.FC<AttendanceTableProps> = ({
 }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [actionFilter, setActionFilter] = useState<'all' | 'in' | 'out'>('all');
+  const [dateRangeMode, setDateRangeMode] = useState<'all' | 'today' | 'week' | 'month' | 'custom'>('all');
+  const [customDateFrom, setCustomDateFrom] = useState('');
+  const [customDateTo, setCustomDateTo] = useState('');
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
 
+  const todayStr = new Date().toISOString().split('T')[0];
+
   const filtered = records.filter((r) => {
+    // 1. Text Search
     const matchesSearch =
       r.surname.toLowerCase().includes(searchTerm.toLowerCase()) ||
       r.time.includes(searchTerm) ||
       (r.raw_text && r.raw_text.toLowerCase().includes(searchTerm.toLowerCase()));
 
+    // 2. Action Filter
     const matchesAction = actionFilter === 'all' || r.action === actionFilter;
 
-    return matchesSearch && matchesAction;
+    // 3. Date Range Filter
+    let matchesDate = true;
+    const recordDate = r.created_at ? r.created_at.substring(0, 10) : '';
+
+    if (dateRangeMode === 'today') {
+      matchesDate = recordDate === todayStr;
+    } else if (dateRangeMode === 'week') {
+      const now = new Date();
+      const past7 = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+      matchesDate = recordDate >= past7 && recordDate <= todayStr;
+    } else if (dateRangeMode === 'month') {
+      const currentMonth = todayStr.substring(0, 7);
+      matchesDate = recordDate.startsWith(currentMonth);
+    } else if (dateRangeMode === 'custom') {
+      if (customDateFrom && recordDate < customDateFrom) matchesDate = false;
+      if (customDateTo && recordDate > customDateTo) matchesDate = false;
+    }
+
+    return matchesSearch && matchesAction && matchesDate;
   });
 
   const toggleSelectAll = () => {
+    triggerHaptic('light');
     if (selectedIds.length === filtered.length && filtered.length > 0) {
       setSelectedIds([]);
     } else {
@@ -45,6 +72,7 @@ export const AttendanceTable: React.FC<AttendanceTableProps> = ({
   };
 
   const toggleSelectRecord = (id: number) => {
+    triggerHaptic('light');
     setSelectedIds((prev) =>
       prev.includes(id) ? prev.filter((i) => i !== id) : [...prev, id]
     );
@@ -53,6 +81,7 @@ export const AttendanceTable: React.FC<AttendanceTableProps> = ({
   const handleBatchDelete = () => {
     if (selectedIds.length === 0) return;
     if (confirm(`Вы уверены, что хотите удалить выбранные записи (${selectedIds.length} шт.)? Они будут окончательно стёрты из SQLite базы.`)) {
+      triggerHaptic('warning');
       if (onBatchDeleteRecords) {
         onBatchDeleteRecords(selectedIds);
       } else {
@@ -64,7 +93,8 @@ export const AttendanceTable: React.FC<AttendanceTableProps> = ({
 
   const handleClearAll = () => {
     if (records.length === 0) return;
-    if (confirm(`ВНИМАНИЕ: Вы действительно хотите очистить ВСЕ ${records.length} записей из базы данных? Это удалит все тестовые отметки.`)) {
+    if (confirm(`ВНИМАНИЕ: Вы действительно хотите очистить ВСЕ ${records.length} записей из базы данных? Это удалит все отметки.`)) {
+      triggerHaptic('warning');
       if (onClearAllRecords) {
         onClearAllRecords();
       }
@@ -73,16 +103,22 @@ export const AttendanceTable: React.FC<AttendanceTableProps> = ({
   };
 
   const exportCSV = () => {
-    const headers = ['ID', 'Дата и время записи', 'Фамилия сотрудника', 'Действие', 'Время на скриншоте', 'Источник', 'Строка распознавания'];
-    const rows = filtered.map((r) => [
-      r.id,
-      `"${r.created_at}"`,
-      `"${r.surname}"`,
-      r.action === 'in' ? 'ПРИХОД' : 'УХОД',
-      `"${r.time}"`,
-      r.source,
-      `"${(r.time_line || '').replace(/"/g, '""')}"`,
-    ]);
+    triggerHaptic('success');
+    const headers = ['ID', 'Дата и время записи', 'Фамилия сотрудника', 'Действие', 'Время на скриншоте', 'Статус смены', 'Источник', 'Строка распознавания'];
+    const rows = filtered.map((r) => {
+      const isLate = r.action === 'in' && isLateCheckIn(r.time);
+      const statusLabel = r.action === 'in' ? (isLate ? 'ОПОЗДАНИЕ' : 'ВОВРЕМЯ') : 'УХОД';
+      return [
+        r.id,
+        `"${r.created_at}"`,
+        `"${r.surname}"`,
+        r.action === 'in' ? 'ПРИХОД' : 'УХОД',
+        `"${r.time}"`,
+        statusLabel,
+        r.source,
+        `"${(r.time_line || '').replace(/"/g, '""')}"`,
+      ];
+    });
 
     // UTF-8 BOM + Разделитель точка с запятой (;) для корректного открытия в Excel (русская локаль)
     const BOM = '\uFEFF';
@@ -99,13 +135,29 @@ export const AttendanceTable: React.FC<AttendanceTableProps> = ({
     URL.revokeObjectURL(url);
   };
 
+  // Helper to detect late check-in (e.g. after 09:05)
+  function isLateCheckIn(timeStr: string): boolean {
+    if (!timeStr) return false;
+    const parts = timeStr.split(':');
+    if (parts.length >= 2) {
+      const h = parseInt(parts[0], 10);
+      const m = parseInt(parts[1], 10);
+      if (!isNaN(h) && !isNaN(m)) {
+        const totalMinutes = h * 60 + m;
+        // 09:05 = 545 minutes
+        return totalMinutes > 545;
+      }
+    }
+    return false;
+  }
+
   return (
     <div id="attendance-section" className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-xs">
       {/* Activity Header */}
       <div className="bg-slate-50 px-6 py-4 border-b border-slate-200 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
         <div>
           <h2 className="font-bold text-xs uppercase tracking-widest text-slate-600">Лента активности смен</h2>
-          <p className="text-[11px] text-slate-400 mt-0.5">Журнал посещаемости и верификации в реальном времени</p>
+          <p className="text-[11px] text-slate-400 mt-0.5">Журнал посещаемости и верификации в реальном времени (SQLite)</p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto justify-start sm:justify-end">
@@ -134,7 +186,10 @@ export const AttendanceTable: React.FC<AttendanceTableProps> = ({
 
           <button
             id="refresh-db-btn"
-            onClick={onRefresh}
+            onClick={() => {
+              triggerHaptic('light');
+              onRefresh();
+            }}
             disabled={loading}
             className="p-2 text-slate-500 hover:text-slate-900 bg-white border border-slate-200 rounded text-xs font-bold uppercase transition-colors"
             title="Обновить записи"
@@ -148,12 +203,15 @@ export const AttendanceTable: React.FC<AttendanceTableProps> = ({
             className="px-3 py-2 bg-slate-100 hover:bg-slate-200 rounded text-xs font-bold text-slate-600 uppercase tracking-tighter transition-colors flex items-center gap-1.5"
           >
             <Download className="w-3.5 h-3.5" />
-            Экспорт CSV
+            Экспорт Excel/CSV
           </button>
 
           <button
             id="add-manual-record-btn"
-            onClick={onOpenAddModal}
+            onClick={() => {
+              triggerHaptic('light');
+              onOpenAddModal();
+            }}
             className="px-4 py-2 bg-cyan-500 hover:bg-cyan-600 rounded text-xs font-bold text-white uppercase tracking-tighter transition-colors shadow-xs flex items-center gap-1.5"
           >
             <Plus className="w-3.5 h-3.5" />
@@ -176,8 +234,9 @@ export const AttendanceTable: React.FC<AttendanceTableProps> = ({
           />
         </div>
 
-        <div className="flex items-center gap-2">
-          <span className="text-slate-400 font-bold uppercase text-[10px]">Фильтр:</span>
+        {/* Action Type Filter */}
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-slate-400 font-bold uppercase text-[10px]">Тип:</span>
           {[
             { key: 'all', label: 'Все' },
             { key: 'in', label: 'Приход (🟢)' },
@@ -185,7 +244,10 @@ export const AttendanceTable: React.FC<AttendanceTableProps> = ({
           ].map((mode) => (
             <button
               key={mode.key}
-              onClick={() => setActionFilter(mode.key as any)}
+              onClick={() => {
+                triggerHaptic('light');
+                setActionFilter(mode.key as any);
+              }}
               className={`px-3 py-1 rounded text-[10px] font-bold uppercase transition-colors ${
                 actionFilter === mode.key
                   ? 'bg-slate-900 text-white'
@@ -195,6 +257,56 @@ export const AttendanceTable: React.FC<AttendanceTableProps> = ({
               {mode.label}
             </button>
           ))}
+        </div>
+
+        {/* Date Range Selector */}
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-slate-400 font-bold uppercase text-[10px] flex items-center gap-1">
+            <Calendar className="w-3 h-3" />
+            Период:
+          </span>
+          {[
+            { key: 'all', label: 'Все' },
+            { key: 'today', label: 'Сегодня' },
+            { key: 'week', label: '7 дней' },
+            { key: 'month', label: 'Этот месяц' },
+            { key: 'custom', label: 'Диапазон' },
+          ].map((m) => (
+            <button
+              key={m.key}
+              onClick={() => {
+                triggerHaptic('light');
+                setDateRangeMode(m.key as any);
+              }}
+              className={`px-2.5 py-1 rounded text-[10px] font-bold uppercase transition-colors ${
+                dateRangeMode === m.key
+                  ? 'bg-cyan-600 text-white shadow-xs'
+                  : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-100'
+              }`}
+            >
+              {m.label}
+            </button>
+          ))}
+
+          {dateRangeMode === 'custom' && (
+            <div className="flex items-center gap-1.5 ml-1">
+              <input
+                type="date"
+                value={customDateFrom}
+                onChange={(e) => setCustomDateFrom(e.target.value)}
+                className="px-2 py-0.5 bg-white border border-slate-200 rounded text-[11px] text-slate-700"
+                placeholder="С"
+              />
+              <span className="text-slate-400 text-xs">—</span>
+              <input
+                type="date"
+                value={customDateTo}
+                onChange={(e) => setCustomDateTo(e.target.value)}
+                className="px-2 py-0.5 bg-white border border-slate-200 rounded text-[11px] text-slate-700"
+                placeholder="По"
+              />
+            </div>
+          )}
         </div>
       </div>
 
@@ -217,21 +329,22 @@ export const AttendanceTable: React.FC<AttendanceTableProps> = ({
                   )}
                 </button>
               </th>
-              <th className="px-4 py-3 border-b border-slate-100">Время записи</th>
+              <th className="px-4 py-3 border-b border-slate-100">Дата и время записи</th>
               <th className="px-4 py-3 border-b border-slate-100">Фамилия / Логин</th>
               <th className="px-4 py-3 border-b border-slate-100">Действие</th>
               <th className="px-4 py-3 border-b border-slate-100">Распознанное время</th>
-              <th className="px-4 py-3 border-b border-slate-100">Статус и источник</th>
+              <th className="px-4 py-3 border-b border-slate-100">Статус смены</th>
+              <th className="px-4 py-3 border-b border-slate-100">Источник</th>
               <th className="px-4 py-3 border-b border-slate-100 text-right">Удалить</th>
             </tr>
           </thead>
           <tbody className="text-sm">
             {filtered.length === 0 ? (
               <tr>
-                <td colSpan={7} className="text-center py-12 text-slate-400">
+                <td colSpan={8} className="text-center py-12 text-slate-400">
                   <div className="flex flex-col items-center justify-center gap-2">
                     <AlertCircle className="w-8 h-8 text-slate-300" />
-                    <p className="text-xs font-bold uppercase tracking-wider text-slate-500">Записи не найдены</p>
+                    <p className="text-xs font-bold uppercase tracking-wider text-slate-500">Записи не найдены за выбранный период</p>
                   </div>
                 </td>
               </tr>
@@ -239,6 +352,8 @@ export const AttendanceTable: React.FC<AttendanceTableProps> = ({
               filtered.map((record) => {
                 const isIn = record.action === 'in';
                 const isSelected = selectedIds.includes(record.id);
+                const isLate = isIn && isLateCheckIn(record.time);
+
                 return (
                   <tr
                     key={record.id}
@@ -262,7 +377,7 @@ export const AttendanceTable: React.FC<AttendanceTableProps> = ({
                     </td>
 
                     <td className="px-4 py-4 font-mono text-xs font-semibold text-slate-700">
-                      {record.time}
+                      {record.created_at || record.time}
                     </td>
 
                     <td className="px-4 py-4 font-semibold text-slate-900">
@@ -287,17 +402,41 @@ export const AttendanceTable: React.FC<AttendanceTableProps> = ({
                       {record.time_line || record.time}
                     </td>
 
+                    {/* Status Badge */}
                     <td className="px-4 py-4 text-xs">
-                      <span className="text-emerald-600 font-medium">✓ Распознано</span>
-                      <span className="text-[10px] text-slate-400 font-mono ml-2 uppercase">
-                        ({record.source.includes('telegram') ? 'Telegram OCR' : 'Веб-форма'})
+                      {isIn ? (
+                        isLate ? (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-amber-50 text-amber-700 border border-amber-200">
+                            <AlertTriangle className="w-3 h-3 text-amber-500" />
+                            Опоздание (&gt; 09:05)
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
+                            <CheckCircle2 className="w-3 h-3 text-emerald-500" />
+                            Вовремя
+                          </span>
+                        )
+                      ) : (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-slate-100 text-slate-700 border border-slate-200">
+                          <Clock className="w-3 h-3 text-slate-400" />
+                          Смена завершена
+                        </span>
+                      )}
+                    </td>
+
+                    <td className="px-4 py-4 text-xs">
+                      <span className="text-slate-600 font-medium">
+                        {record.source?.includes('telegram') ? '📱 Telegram Bot' : '💻 Веб-форма'}
                       </span>
                     </td>
 
                     <td className="px-4 py-4 text-right">
                       <button
                         id={`delete-record-btn-${record.id}`}
-                        onClick={() => onDeleteRecord(record.id)}
+                        onClick={() => {
+                          triggerHaptic('light');
+                          onDeleteRecord(record.id);
+                        }}
                         className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded transition-colors"
                         title="Удалить запись окончательно"
                       >
@@ -315,8 +454,9 @@ export const AttendanceTable: React.FC<AttendanceTableProps> = ({
       {/* Table Footer */}
       <div className="px-6 py-3 border-t border-slate-200 bg-slate-50 text-[10px] text-slate-400 font-medium uppercase tracking-widest flex justify-between items-center">
         <span>Отображено записей: {filtered.length} (Всего в базе: {records.length})</span>
-        <span className="text-emerald-600 font-semibold">SQLite: shift_attendance.db (Синхронизировано)</span>
+        <span className="text-emerald-600 font-semibold">SQLite: shift_attendance.db (WAL Active)</span>
       </div>
     </div>
   );
 };
+

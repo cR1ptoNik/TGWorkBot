@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Clock, Bell, CheckCircle2, Save } from 'lucide-react';
 import { ScheduleConfig } from '../types';
-import { apiFetch } from '../lib/api';
+import { apiFetch, triggerHaptic } from '../lib/api';
 
 export const ScheduleManager: React.FC = () => {
   const [schedule, setSchedule] = useState<ScheduleConfig>({
@@ -38,10 +38,12 @@ export const ScheduleManager: React.FC = () => {
       });
       const data = await res.json();
       if (data.success) {
-        setMsg('Shift schedule and auto-reminder settings saved successfully!');
+        triggerHaptic('success');
+        setMsg('Настройки графика смен и авто-напоминаний успешно сохранены!');
       }
     } catch (e: any) {
-      setMsg(`Error saving schedule: ${e.message}`);
+      triggerHaptic('error');
+      setMsg(`Ошибка сохранения графика: ${e.message}`);
     } finally {
       setSaving(false);
     }

@@ -35,6 +35,10 @@ function getDb(): any {
     const sqliteModule = (Function('return typeof require !== "undefined" ? require("node:sqlite") : null'))();
     if (sqliteModule && sqliteModule.DatabaseSync) {
       const db = new sqliteModule.DatabaseSync(DB_FILE);
+      try {
+        db.exec("PRAGMA journal_mode = WAL;");
+        db.exec("PRAGMA busy_timeout = 5000;");
+      } catch (e) {}
       db.exec(`
         CREATE TABLE IF NOT EXISTS shift_records (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,6 +64,10 @@ function getDb(): any {
           details TEXT
         )
       `);
+      try {
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_shift_records_created_at ON shift_records(created_at);`);
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_shift_records_user ON shift_records(telegram_user_id, created_at);`);
+      } catch (e) {}
       cachedDb = db;
       return cachedDb;
     }
@@ -420,13 +428,19 @@ app.get("/api/stats", (req, res) => {
 // Get Shift Records (with filter & query)
 app.get("/api/records", (req, res) => {
   let records = readShiftRecords();
-  const { surname, date, action, search } = req.query;
+  const { surname, date, date_from, date_to, action, search } = req.query;
 
   if (surname) {
     records = records.filter((r: any) => r.surname.toLowerCase().includes(String(surname).toLowerCase()));
   }
   if (date) {
     records = records.filter((r: any) => r.created_at && r.created_at.startsWith(String(date)));
+  }
+  if (date_from) {
+    records = records.filter((r: any) => r.created_at && r.created_at.substring(0, 10) >= String(date_from));
+  }
+  if (date_to) {
+    records = records.filter((r: any) => r.created_at && r.created_at.substring(0, 10) <= String(date_to));
   }
   if (action && (action === "in" || action === "out")) {
     records = records.filter((r: any) => r.action === action);

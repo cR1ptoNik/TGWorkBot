@@ -11,3 +11,22 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
 
   return fetch(input, options);
 }
+
+/**
+ * Triggers native Telegram WebApp haptic vibration feedback on mobile devices
+ */
+export function triggerHaptic(type: 'success' | 'warning' | 'error' | 'light' | 'medium' = 'success') {
+  try {
+    // @ts-ignore
+    const hf = typeof window !== 'undefined' ? window.Telegram?.WebApp?.HapticFeedback : null;
+    if (!hf) return;
+    if (type === 'success' || type === 'warning' || type === 'error') {
+      hf.notificationOccurred(type);
+    } else {
+      hf.impactOccurred(type);
+    }
+  } catch (e) {
+    // Ignore if not supported
+  }
+}
+

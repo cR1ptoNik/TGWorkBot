@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { X, Plus, LogIn, LogOut, Clock, User } from 'lucide-react';
+import { triggerHaptic } from '../lib/api';
 
 interface AddRecordModalProps {
   isOpen: boolean;
@@ -24,8 +25,10 @@ export const AddRecordModal: React.FC<AddRecordModalProps> = ({ isOpen, onClose,
     setSubmitting(true);
     try {
       await onSave({ surname: surname.trim(), action, time: time.trim(), notes: notes.trim(), date });
+      triggerHaptic('success');
       onClose();
     } catch (e) {
+      triggerHaptic('error');
       console.error(e);
     } finally {
       setSubmitting(false);

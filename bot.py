@@ -117,7 +117,12 @@ def save_schedule_config(data: dict):
 # --- Database & Persistence Logging Layer ---
 
 def get_db_connection():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=10.0)
+    try:
+        conn.execute("PRAGMA journal_mode = WAL;")
+        conn.execute("PRAGMA busy_timeout = 5000;")
+    except Exception:
+        pass
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -163,6 +168,9 @@ def init_db():
                 UNIQUE(date, reminder_type, telegram_user_id)
             )
         """)
+        # Indices for optimal query performance
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_shift_records_created_at ON shift_records(created_at);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_shift_records_user ON shift_records(telegram_user_id, created_at);")
         conn.commit()
     logger.info("Database initialized successfully.")
 
@@ -245,8 +253,14 @@ def atomic_save_file(file_path: str, data: dict):
 # --- Helper Timezone Functions ---
 
 def get_current_time() -> datetime:
-    tz = timezone(timedelta(hours=TIMEZONE_OFFSET_HOURS))
-    return datetime.now(tz)
+    try:
+        config = load_schedule_config()
+        tz_offset = config.get("tz_offset_hours", TIMEZONE_OFFSET_HOURS)
+        tz = timezone(timedelta(hours=int(tz_offset)))
+        return datetime.now(tz)
+    except Exception:
+        tz = timezone(timedelta(hours=TIMEZONE_OFFSET_HOURS))
+        return datetime.now(tz)
 
 
 # --- OCR & Text Parsing Logic ---
@@ -1074,6 +1088,27 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     final_surname = parsed.get("surname") or get_surname_for_user(user_id) or f"User_{user_id}"
     resolution_source = parsed.get("resolution_source", "unknown")
 
+    # Duplicate submission guard: prevent accidental double-uploads
+    today = get_current_time().date().isoformat()
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id, action, time, created_at FROM shift_records WHERE telegram_user_id = ? AND created_at LIKE ? ORDER BY id DESC LIMIT 1",
+                (user_id, f"{today}%")
+            )
+            prev = cursor.fetchone()
+            if prev and prev["action"] == action and prev["time"] == time_value:
+                action_label = "🟢 Приход" if action == "in" else "🔴 Уход"
+                await update.message.reply_text(
+                    f"ℹ️ Отметка {action_label} со временем {time_value} уже зафиксирована в системе ранее ({prev['created_at']}).\n"
+                    f"Повторное сохранение не требуется!"
+                )
+                await send_main_menu(update, context)
+                return
+    except Exception as e:
+        logger.error(f"Duplicate check error: {e}")
+
     record = {
         "chat_id": update.effective_chat.id,
         "telegram_user_id": user_id,
@@ -1217,7 +1252,11 @@ async def reminder_scheduler_loop(bot):
                                     conn.commit()
                                     log_audit_event("INFO", "REMINDER_SENT_START", f"Sent start shift reminder to {surname} ({uid})")
                                 except Exception as err:
-                                    logger.error(f"Failed sending start reminder to {uid}: {err}")
+                                    err_str = str(err).lower()
+                                    if "forbidden" in err_str or "blocked" in err_str or "chat not found" in err_str:
+                                        log_audit_event("WARNING", "USER_BLOCKED_BOT", f"User {uid} ({surname}) blocked the bot. Skipped start reminder.", user_id=uid)
+                                    else:
+                                        logger.error(f"Failed sending start reminder to {uid}: {err}")
 
             # --- Check End Reminder Window (from end reminder time up to 120 mins after end) ---
             if remind_end_dt <= now <= (end_dt + timedelta(minutes=120)):
@@ -1248,7 +1287,11 @@ async def reminder_scheduler_loop(bot):
                                     conn.commit()
                                     log_audit_event("INFO", "REMINDER_SENT_END", f"Sent end shift reminder to {surname} ({uid})")
                                 except Exception as err:
-                                    logger.error(f"Failed sending end reminder to {uid}: {err}")
+                                    err_str = str(err).lower()
+                                    if "forbidden" in err_str or "blocked" in err_str or "chat not found" in err_str:
+                                        log_audit_event("WARNING", "USER_BLOCKED_BOT", f"User {uid} ({surname}) blocked the bot. Skipped end reminder.", user_id=uid)
+                                    else:
+                                        logger.error(f"Failed sending end reminder to {uid}: {err}")
 
         except Exception as e:
             logger.error(f"Error in reminder scheduler loop: {e}")
