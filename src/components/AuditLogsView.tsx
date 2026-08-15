@@ -132,17 +132,22 @@ export const AuditLogsView: React.FC<AuditLogsViewProps> = ({
           </div>
         ) : (
           filteredLogs.map((log) => {
-            let levelBadge = 'text-cyan-400';
-            if (log.level === 'WARNING') levelBadge = 'text-amber-400 font-bold';
-            if (log.level === 'ERROR') levelBadge = 'text-rose-400 font-bold';
+            let levelBadge = 'text-cyan-400 border-cyan-800 bg-cyan-950/40';
+            if (log.level === 'WARNING') levelBadge = 'text-amber-400 font-bold border-amber-800 bg-amber-950/40';
+            if (log.level === 'ERROR') levelBadge = 'text-rose-400 font-bold border-rose-800 bg-rose-950/40';
+
+            // Check if log is a DB record saved/created event
+            const isRecordLog = log.message.includes('DB_RECORD_SAVED') || log.message.includes('MANUAL_RECORD_ADDED') || log.message.includes('RECORD_DELETED');
 
             return (
-              <div key={log.id} id={`log-item-${log.id}`} className="hover:bg-slate-900/80 p-1.5 rounded flex flex-col sm:flex-row sm:items-start gap-2 leading-relaxed border-b border-slate-900/60">
-                <span className="text-slate-500 text-[10px] shrink-0">{log.timestamp}</span>
-                <span className={`text-[10px] uppercase w-16 shrink-0 ${levelBadge}`}>
-                  [{log.level}]
-                </span>
-                <span className="text-slate-300 break-all">{log.message}</span>
+              <div key={log.id} id={`log-item-${log.id}`} className={`hover:bg-slate-900/80 p-2 rounded flex flex-col sm:flex-row sm:items-center gap-2.5 leading-relaxed border-b border-slate-900/60 ${isRecordLog ? 'bg-slate-900/40' : ''}`}>
+                <div className="flex items-center gap-2 shrink-0">
+                  <span className="text-slate-500 text-[10px] shrink-0 font-mono bg-slate-900 px-1.5 py-0.5 rounded border border-slate-800">{log.timestamp}</span>
+                  <span className={`text-[9px] uppercase px-1.5 py-0.5 rounded border font-mono ${levelBadge}`}>
+                    {log.level}
+                  </span>
+                </div>
+                <span className="text-slate-200 break-all font-mono text-xs">{log.message}</span>
               </div>
             );
           })

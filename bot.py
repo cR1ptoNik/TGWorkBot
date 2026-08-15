@@ -232,8 +232,14 @@ def save_shift_record_to_db(record: dict):
         action_label = str(record.get('action') or 'in').upper()
         surname_label = str(record.get('surname') or 'Unknown')
         time_label = str(record.get('time') or '')
+        date_label = str(record.get('created_at') or '').split(' ')[0] or get_current_time().date().isoformat()
         uid = record.get("telegram_user_id")
-        log_audit_event("INFO", "DB_RECORD_SAVED", f"Recorded {action_label} for {surname_label} at {time_label} (ID: {record_id})", user_id=uid if isinstance(uid, int) else None)
+        log_audit_event(
+            "INFO",
+            "DB_RECORD_SAVED",
+            f"Recorded {action_label} for {surname_label} on {date_label} at {time_label} (ID: {record_id})",
+            user_id=uid if isinstance(uid, int) else None
+        )
         
         sync_db_to_json()
         return True

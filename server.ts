@@ -89,6 +89,35 @@ const ai = new GoogleGenAI({
   },
 });
 
+// Data Helper Functions
+function getTzOffsetHours(): number {
+  try {
+    const cfg = readScheduleConfig();
+    return typeof cfg.tz_offset_hours === "number" ? cfg.tz_offset_hours : 3;
+  } catch (e) {
+    return 3;
+  }
+}
+
+function getAdjustedDate(offsetHours: number = getTzOffsetHours()): { dateStr: string; timeStr: string; fullStr: string } {
+  const now = new Date();
+  const utcMs = now.getTime() + now.getTimezoneOffset() * 60000;
+  const localDate = new Date(utcMs + offsetHours * 3600000);
+  
+  const yyyy = localDate.getFullYear();
+  const mm = String(localDate.getMonth() + 1).padStart(2, '0');
+  const dd = String(localDate.getDate()).padStart(2, '0');
+  const hh = String(localDate.getHours()).padStart(2, '0');
+  const min = String(localDate.getMinutes()).padStart(2, '0');
+  const ss = String(localDate.getSeconds()).padStart(2, '0');
+
+  const dateStr = `${yyyy}-${mm}-${dd}`;
+  const timeStr = `${hh}:${min}:${ss}`;
+  const fullStr = `${dateStr} ${timeStr}`;
+
+  return { dateStr, timeStr, fullStr };
+}
+
 // Seed default sample data if files don't exist
 function initDefaultData() {
   if (!fs.existsSync(ROLES_FILE)) {
@@ -111,64 +140,63 @@ function initDefaultData() {
     fs.writeFileSync(SCHEDULE_FILE, JSON.stringify(defaultSchedule, null, 2), "utf-8");
   }
 
-  const today = new Date().toISOString().split("T")[0];
-  const defaultRecordsList = [
-    {
-      id: 1,
-      chat_id: 1001,
-      telegram_user_id: 123456789,
-      action: "in",
-      surname: "Иванов.А.В",
-      time: "08:30:15",
-      time_line: "Shift start Grade 08:30:15",
-      raw_text: "RMAS Mobile Grade 08:30:15 Check In Иванов.А.В",
-      source: "telegram_ocr",
-      created_at: `${today} 08:30:15`,
-    },
-    {
-      id: 2,
-      chat_id: 1002,
-      telegram_user_id: 987654321,
-      action: "in",
-      surname: "Петров.С.И",
-      time: "08:45:00",
-      time_line: "Logged in 08:45:00",
-      raw_text: "WorkTime Logged in 08:45:00 Петров.С.И",
-      source: "telegram_ocr",
-      created_at: `${today} 08:45:00`,
-    },
-    {
-      id: 3,
-      chat_id: 1003,
-      telegram_user_id: 555444333,
-      action: "in",
-      surname: "Сидорова.Е.М",
-      time: "09:00:22",
-      time_line: "Time: 09:00:22",
-      raw_text: "Attendance check 09:00:22 Сидорова.Е.М",
-      source: "web_manual",
-      created_at: `${today} 09:00:22`,
-    },
-    {
-      id: 4,
-      chat_id: 1001,
-      telegram_user_id: 123456789,
-      action: "out",
-      surname: "Иванов.А.В",
-      time: "17:30:10",
-      time_line: "Shift end Grade 17:30:10",
-      raw_text: "RMAS Mobile Grade 17:30:10 Check Out Иванов.А.В",
-      source: "telegram_ocr",
-      created_at: `${today} 17:30:10`,
-    },
-  ];
+  // Only seed records if NEITHER db nor json file exists
+  if (!fs.existsSync(DATA_FILE) && !fs.existsSync(DB_FILE)) {
+    const { dateStr } = getAdjustedDate(3);
+    const defaultRecordsList = [
+      {
+        id: 1,
+        chat_id: 1001,
+        telegram_user_id: 123456789,
+        action: "in",
+        surname: "Иванов.А.В",
+        time: "08:30:15",
+        time_line: "Shift start Grade 08:30:15",
+        raw_text: "RMAS Mobile Grade 08:30:15 Check In Иванов.А.В",
+        source: "telegram_ocr",
+        created_at: `${dateStr} 08:30:15`,
+      },
+      {
+        id: 2,
+        chat_id: 1002,
+        telegram_user_id: 987654321,
+        action: "in",
+        surname: "Петров.С.И",
+        time: "08:45:00",
+        time_line: "Logged in 08:45:00",
+        raw_text: "WorkTime Logged in 08:45:00 Петров.С.И",
+        source: "telegram_ocr",
+        created_at: `${dateStr} 08:45:00`,
+      },
+      {
+        id: 3,
+        chat_id: 1003,
+        telegram_user_id: 555444333,
+        action: "in",
+        surname: "Сидорова.Е.М",
+        time: "09:00:22",
+        time_line: "Time: 09:00:22",
+        raw_text: "Attendance check 09:00:22 Сидорова.Е.М",
+        source: "web_manual",
+        created_at: `${dateStr} 09:00:22`,
+      },
+      {
+        id: 4,
+        chat_id: 1001,
+        telegram_user_id: 123456789,
+        action: "out",
+        surname: "Иванов.А.В",
+        time: "17:30:10",
+        time_line: "Shift end Grade 17:30:10",
+        raw_text: "RMAS Mobile Grade 17:30:10 Check Out Иванов.А.В",
+        source: "telegram_ocr",
+        created_at: `${dateStr} 17:30:10`,
+      },
+    ];
 
-  // Seed DB if table is empty
-  const db = getDb();
-  if (db) {
-    try {
-      const rowCount = db.prepare("SELECT count(*) as cnt FROM shift_records").get() as any;
-      if (!rowCount || rowCount.cnt === 0) {
+    const db = getDb();
+    if (db) {
+      try {
         const stmt = db.prepare(`
           INSERT INTO shift_records (id, chat_id, telegram_user_id, action, surname, time, time_line, raw_text, source, created_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -176,26 +204,24 @@ function initDefaultData() {
         for (const r of defaultRecordsList) {
           stmt.run(r.id, r.chat_id, r.telegram_user_id, r.action, r.surname, r.time, r.time_line, r.raw_text, r.source, r.created_at);
         }
+      } catch (e) {
+        console.error("Failed initial seed of DB:", e);
       }
-    } catch (e) {
-      console.error("Failed seeding DB:", e);
     }
-  }
 
-  if (!fs.existsSync(DATA_FILE)) {
     fs.writeFileSync(DATA_FILE, JSON.stringify({ records: defaultRecordsList, updated_at: new Date().toISOString() }, null, 2), "utf-8");
   }
 
   if (!fs.existsSync(LOGS_FILE)) {
-    const now = new Date().toISOString().replace("T", " ").split(".")[0];
+    const { fullStr } = getAdjustedDate(3);
     const initialLogs = [
-      `${now} | INFO     | ShiftBotLogger | Initializing SQLite database tables...`,
-      `${now} | INFO     | ShiftBotLogger | Database initialized successfully.`,
-      `${now} | INFO     | ShiftBotLogger | Starting Telegram Bot with token prefix: 123456789...`,
-      `${now} | INFO     | ShiftBotLogger | DB_RECORD_SAVED: Recorded IN for Иванов.А.В at 08:30:15`,
-      `${now} | INFO     | ShiftBotLogger | DB_RECORD_SAVED: Recorded IN for Петров.С.И at 08:45:00`,
-      `${now} | INFO     | ShiftBotLogger | DB_RECORD_SAVED: Recorded IN for Сидорова.Е.М at 09:00:22`,
-      `${now} | INFO     | ShiftBotLogger | DB_RECORD_SAVED: Recorded OUT for Иванов.А.В at 17:30:10`,
+      `${fullStr} | INFO     | ShiftBotLogger | Initializing SQLite database tables...`,
+      `${fullStr} | INFO     | ShiftBotLogger | Database initialized successfully.`,
+      `${fullStr} | INFO     | ShiftBotLogger | Starting Telegram Bot with token prefix: 123456789...`,
+      `${fullStr} | INFO     | ShiftBotLogger | DB_RECORD_SAVED: Recorded IN for Иванов.А.В on ${fullStr.split(" ")[0]} at 08:30:15 (ID: 1)`,
+      `${fullStr} | INFO     | ShiftBotLogger | DB_RECORD_SAVED: Recorded IN for Петров.С.И on ${fullStr.split(" ")[0]} at 08:45:00 (ID: 2)`,
+      `${fullStr} | INFO     | ShiftBotLogger | DB_RECORD_SAVED: Recorded IN for Сидорова.Е.М on ${fullStr.split(" ")[0]} at 09:00:22 (ID: 3)`,
+      `${fullStr} | INFO     | ShiftBotLogger | DB_RECORD_SAVED: Recorded OUT for Иванов.А.В on ${fullStr.split(" ")[0]} at 17:30:10 (ID: 4)`,
     ].join("\n");
     fs.writeFileSync(LOGS_FILE, initialLogs + "\n", "utf-8");
   }
@@ -204,9 +230,9 @@ function initDefaultData() {
 initDefaultData();
 
 function addLogEntry(level: string, message: string) {
-  const timeStr = new Date().toISOString().replace("T", " ").split(".")[0];
+  const { fullStr } = getAdjustedDate();
   const padLevel = level.padEnd(8, " ");
-  const line = `${timeStr} | ${padLevel} | ShiftBotLogger | ${message}\n`;
+  const line = `${fullStr} | ${padLevel} | ShiftBotLogger | ${message}\n`;
   try {
     fs.appendFileSync(LOGS_FILE, line, "utf-8");
   } catch (err) {
@@ -398,7 +424,7 @@ app.get("/api/health", (req, res) => {
 app.get("/api/stats", (req, res) => {
   const records = readShiftRecords();
   const roles = readRoles();
-  const today = new Date().toISOString().split("T")[0];
+  const { dateStr: today } = getAdjustedDate();
 
   const todayRecords = records.filter((r: any) => r.created_at && r.created_at.startsWith(today));
 
@@ -468,7 +494,8 @@ app.post("/api/records", (req, res) => {
     return res.status(400).json({ error: "Surname, action, and time are required." });
   }
 
-  const recordDate = date || new Date().toISOString().split("T")[0];
+  const { dateStr } = getAdjustedDate();
+  const recordDate = date || dateStr;
   const newRecord = {
     id: Date.now(),
     chat_id: 1000 + Math.floor(Math.random() * 9000),
@@ -501,7 +528,7 @@ app.post("/api/records", (req, res) => {
     records.push(newRecord);
   }
   writeShiftRecords(records);
-  addLogEntry("INFO", `MANUAL_RECORD_ADDED: Added ${newRecord.action.toUpperCase()} for ${newRecord.surname} at ${newRecord.time}`);
+  addLogEntry("INFO", `MANUAL_RECORD_ADDED: Added ${newRecord.action.toUpperCase()} for ${newRecord.surname} on ${recordDate} at ${newRecord.time}`);
 
   res.json({ success: true, record: newRecord });
 });
@@ -509,6 +536,8 @@ app.post("/api/records", (req, res) => {
 // Delete Record
 app.delete("/api/records/:id", (req, res) => {
   const recordId = Number(req.params.id);
+  let records = readShiftRecords();
+  const targetRecord = records.find((r: any) => Number(r.id) === recordId);
 
   const db = getDb();
   if (db) {
@@ -529,11 +558,11 @@ app.delete("/api/records/:id", (req, res) => {
     }
   }
 
-  let records = readShiftRecords();
   records = records.filter((r: any) => Number(r.id) !== recordId);
 
   writeShiftRecords(records);
-  addLogEntry("WARNING", `RECORD_DELETED: Removed shift record ID ${recordId}`);
+  const info = targetRecord ? `(${targetRecord.surname} on ${targetRecord.created_at})` : `ID ${recordId}`;
+  addLogEntry("WARNING", `RECORD_DELETED: Removed shift record ${info}`);
   res.json({ success: true });
 });
 
@@ -826,17 +855,19 @@ app.get("/api/schedule", (req, res) => {
 
 // Update Shift Schedule
 app.post("/api/schedule", (req, res) => {
-  const { shift_start, shift_end, remind_before_start_minutes, remind_after_end_minutes, enabled } = req.body;
+  const { shift_start, shift_end, tz_offset_hours, remind_before_start_minutes, remind_after_end_minutes, enabled } = req.body;
   const current = readScheduleConfig();
   const updated = {
     ...current,
     shift_start: shift_start || current.shift_start,
     shift_end: shift_end || current.shift_end,
+    tz_offset_hours: tz_offset_hours !== undefined ? Number(tz_offset_hours) : (current.tz_offset_hours ?? 3),
     remind_before_start_minutes: remind_before_start_minutes ?? current.remind_before_start_minutes,
     remind_after_end_minutes: remind_after_end_minutes ?? current.remind_after_end_minutes,
     enabled: enabled ?? current.enabled,
   };
   writeScheduleConfig(updated);
+  addLogEntry("INFO", `SCHEDULE_UPDATED: Updated schedule (Start=${updated.shift_start}, End=${updated.shift_end}, UTC+${updated.tz_offset_hours})`);
   res.json({ success: true, schedule: updated });
 });
 
