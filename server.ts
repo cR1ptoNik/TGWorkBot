@@ -4,10 +4,12 @@ import fs from "fs";
 import crypto from "crypto";
 import child_process from "child_process";
 import dotenv from "dotenv";
+import { createRequire } from "module";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 
 dotenv.config();
+const require = createRequire(import.meta.url);
 
 const app = express();
 const PORT = 3000;
@@ -30,9 +32,7 @@ function getDb(): any {
   if (sqliteChecked) return null;
 
   try {
-    // Dynamically attempt loading node:sqlite for Node 22.5+
-    // Wrapped to prevent crashes on Node.js 18 / 20
-    const sqliteModule = (Function('return typeof require !== "undefined" ? require("node:sqlite") : null'))();
+    const sqliteModule = require("node:sqlite");
     if (sqliteModule && sqliteModule.DatabaseSync) {
       const db = new sqliteModule.DatabaseSync(DB_FILE);
       try {
@@ -64,6 +64,16 @@ function getDb(): any {
           details TEXT
         )
       `);
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS sent_reminders (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          date TEXT NOT NULL,
+          reminder_type TEXT NOT NULL,
+          telegram_user_id INTEGER NOT NULL,
+          sent_at TEXT NOT NULL,
+          UNIQUE(date, reminder_type, telegram_user_id)
+        )
+      `);
       try {
         db.exec(`CREATE INDEX IF NOT EXISTS idx_shift_records_created_at ON shift_records(created_at);`);
         db.exec(`CREATE INDEX IF NOT EXISTS idx_shift_records_user ON shift_records(telegram_user_id, created_at);`);
@@ -72,7 +82,7 @@ function getDb(): any {
       return cachedDb;
     }
   } catch (err) {
-    // node:sqlite is not supported on Node.js < 22.5.0; fallback to JSON storage
+    console.error("node:sqlite load error:", err);
   }
 
   sqliteChecked = true;
@@ -140,8 +150,12 @@ function initDefaultData() {
     fs.writeFileSync(SCHEDULE_FILE, JSON.stringify(defaultSchedule, null, 2), "utf-8");
   }
 
-  // Only seed records if NEITHER db nor json file exists
-  if (!fs.existsSync(DATA_FILE) && !fs.existsSync(DB_FILE)) {
+  const db = getDb();
+  const dbExisted = fs.existsSync(DB_FILE);
+  const jsonExisted = fs.existsSync(DATA_FILE);
+
+  // Only seed initial sample records if NEITHER file existed on disk previously
+  if (!jsonExisted && !dbExisted) {
     const { dateStr } = getAdjustedDate(3);
     const defaultRecordsList = [
       {
@@ -194,7 +208,6 @@ function initDefaultData() {
       },
     ];
 
-    const db = getDb();
     if (db) {
       try {
         const stmt = db.prepare(`
@@ -218,10 +231,6 @@ function initDefaultData() {
       `${fullStr} | INFO     | ShiftBotLogger | Initializing SQLite database tables...`,
       `${fullStr} | INFO     | ShiftBotLogger | Database initialized successfully.`,
       `${fullStr} | INFO     | ShiftBotLogger | Starting Telegram Bot with token prefix: 123456789...`,
-      `${fullStr} | INFO     | ShiftBotLogger | DB_RECORD_SAVED: Recorded IN for Иванов.А.В on ${fullStr.split(" ")[0]} at 08:30:15 (ID: 1)`,
-      `${fullStr} | INFO     | ShiftBotLogger | DB_RECORD_SAVED: Recorded IN for Петров.С.И on ${fullStr.split(" ")[0]} at 08:45:00 (ID: 2)`,
-      `${fullStr} | INFO     | ShiftBotLogger | DB_RECORD_SAVED: Recorded IN for Сидорова.Е.М on ${fullStr.split(" ")[0]} at 09:00:22 (ID: 3)`,
-      `${fullStr} | INFO     | ShiftBotLogger | DB_RECORD_SAVED: Recorded OUT for Иванов.А.В on ${fullStr.split(" ")[0]} at 17:30:10 (ID: 4)`,
     ].join("\n");
     fs.writeFileSync(LOGS_FILE, initialLogs + "\n", "utf-8");
   }
@@ -241,31 +250,33 @@ function addLogEntry(level: string, message: string) {
 }
 
 // Data Helper Functions
-function readShiftRecords() {
-  try {
-    const db = getDb();
-    if (db) {
+function readShiftRecords(): any[] {
+  const db = getDb();
+  if (db) {
+    try {
       const rows = db.prepare("SELECT * FROM shift_records ORDER BY id ASC").all() as any[];
-      if (rows) {
-        // keep JSON file synchronized
-        try {
-          fs.writeFileSync(
-            DATA_FILE,
-            JSON.stringify({ records: rows, updated_at: new Date().toISOString() }, null, 2),
-            "utf-8"
-          );
-        } catch (err) {}
-        return rows;
-      }
+      const safeRows = rows || [];
+      // Keep JSON file synchronized
+      try {
+        fs.writeFileSync(
+          DATA_FILE,
+          JSON.stringify({ records: safeRows, updated_at: new Date().toISOString() }, null, 2),
+          "utf-8"
+        );
+      } catch (err) {}
+      return safeRows;
+    } catch (e) {
+      console.error("readShiftRecords DB error:", e);
     }
-  } catch (e) {
-    console.error("readShiftRecords DB error:", e);
   }
 
   try {
-    const raw = fs.readFileSync(DATA_FILE, "utf-8");
-    const data = JSON.parse(raw);
-    return data.records || [];
+    if (fs.existsSync(DATA_FILE)) {
+      const raw = fs.readFileSync(DATA_FILE, "utf-8");
+      const data = JSON.parse(raw);
+      return Array.isArray(data.records) ? data.records : [];
+    }
+    return [];
   } catch (e) {
     return [];
   }
@@ -275,7 +286,7 @@ function writeShiftRecords(records: any[]) {
   try {
     fs.writeFileSync(
       DATA_FILE,
-      JSON.stringify({ records, updated_at: new Date().toISOString() }, null, 2),
+      JSON.stringify({ records: records || [], updated_at: new Date().toISOString() }, null, 2),
       "utf-8"
     );
     return true;
@@ -536,34 +547,28 @@ app.post("/api/records", (req, res) => {
 // Delete Record
 app.delete("/api/records/:id", (req, res) => {
   const recordId = Number(req.params.id);
-  let records = readShiftRecords();
-  const targetRecord = records.find((r: any) => Number(r.id) === recordId);
-
   const db = getDb();
+  let targetRecord: any = null;
+
   if (db) {
     try {
+      targetRecord = db.prepare("SELECT * FROM shift_records WHERE id = ?").get(recordId);
       db.prepare("DELETE FROM shift_records WHERE id = ?").run(recordId);
     } catch (e) {
       console.error("Failed deleting record from DB:", e);
     }
-  } else {
-    // Fallback on Node < 22 without node:sqlite: execute python sqlite3 command to delete from shift_attendance.db
-    try {
-      child_process.execSync(
-        `python3 -c "import sqlite3; conn = sqlite3.connect('${DB_FILE}'); conn.execute('DELETE FROM shift_records WHERE id=?', (${recordId},)); conn.commit(); conn.close()"`,
-        { stdio: "ignore" }
-      );
-    } catch (e) {
-      console.error("Python sqlite fallback delete error:", e);
-    }
   }
 
+  let records = readShiftRecords();
+  if (!targetRecord) {
+    targetRecord = records.find((r: any) => Number(r.id) === recordId);
+  }
   records = records.filter((r: any) => Number(r.id) !== recordId);
-
   writeShiftRecords(records);
+
   const info = targetRecord ? `(${targetRecord.surname} on ${targetRecord.created_at})` : `ID ${recordId}`;
   addLogEntry("WARNING", `RECORD_DELETED: Removed shift record ${info}`);
-  res.json({ success: true });
+  res.json({ success: true, count: records.length });
 });
 
 // Clear All Shift Records (Batch Wipe for testing/cleanup)
@@ -574,15 +579,6 @@ app.post("/api/records/clear", (req, res) => {
       db.prepare("DELETE FROM shift_records").run();
     } catch (e) {
       console.error("Failed clearing DB records:", e);
-    }
-  } else {
-    try {
-      child_process.execSync(
-        `python3 -c "import sqlite3; conn = sqlite3.connect('${DB_FILE}'); conn.execute('DELETE FROM shift_records'); conn.commit(); conn.close()"`,
-        { stdio: "ignore" }
-      );
-    } catch (e) {
-      console.error("Python sqlite clear error:", e);
     }
   }
 
@@ -598,24 +594,15 @@ app.post("/api/records/batch-delete", (req, res) => {
     return res.status(400).json({ error: "Array of ids is required" });
   }
 
-  const idSet = new Set(ids.map(Number));
+  const numIds = ids.map(Number);
+  const idSet = new Set(numIds);
   const db = getDb();
   if (db) {
     try {
       const placeholders = ids.map(() => "?").join(",");
-      db.prepare(`DELETE FROM shift_records WHERE id IN (${placeholders})`).run(...ids.map(Number));
+      db.prepare(`DELETE FROM shift_records WHERE id IN (${placeholders})`).run(...numIds);
     } catch (e) {
       console.error("Failed batch deleting from DB:", e);
-    }
-  } else {
-    try {
-      const idsStr = ids.map(Number).join(",");
-      child_process.execSync(
-        `python3 -c "import sqlite3; conn = sqlite3.connect('${DB_FILE}'); conn.execute('DELETE FROM shift_records WHERE id IN (${idsStr})'); conn.commit(); conn.close()"`,
-        { stdio: "ignore" }
-      );
-    } catch (e) {
-      console.error("Python sqlite batch delete error:", e);
     }
   }
 
@@ -623,7 +610,7 @@ app.post("/api/records/batch-delete", (req, res) => {
   records = records.filter((r: any) => !idSet.has(Number(r.id)));
   writeShiftRecords(records);
   addLogEntry("WARNING", `BATCH_RECORDS_DELETED: Deleted ${ids.length} records.`);
-  res.json({ success: true, deletedCount: ids.length });
+  res.json({ success: true, deletedCount: ids.length, count: records.length });
 });
 
 // Get System Audit Logs

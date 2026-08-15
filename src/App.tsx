@@ -190,6 +190,10 @@ export default function App() {
 
   const handleDeleteRecord = async (id: number) => {
     if (!confirm('Вы уверены, что хотите удалить эту отметку смены?')) return;
+    // Optimistically update UI
+    setRecords((prev) => prev.filter((r) => r.id !== id));
+    setStats((prev) => (prev ? { ...prev, total_records: Math.max(0, prev.total_records - 1) } : null));
+
     try {
       const res = await apiFetch(`/api/records/${id}`, { method: 'DELETE' });
       if (res.ok) {
@@ -197,10 +201,16 @@ export default function App() {
       }
     } catch (e) {
       console.error('Error deleting record:', e);
+      fetchData();
     }
   };
 
   const handleBatchDeleteRecords = async (ids: number[]) => {
+    const idSet = new Set(ids);
+    // Optimistically update UI
+    setRecords((prev) => prev.filter((r) => !idSet.has(r.id)));
+    setStats((prev) => (prev ? { ...prev, total_records: Math.max(0, prev.total_records - ids.length) } : null));
+
     try {
       const res = await apiFetch('/api/records/batch-delete', {
         method: 'POST',
@@ -212,10 +222,15 @@ export default function App() {
       }
     } catch (e) {
       console.error('Error batch deleting records:', e);
+      fetchData();
     }
   };
 
   const handleClearAllRecords = async () => {
+    // Optimistically update UI
+    setRecords([]);
+    setStats((prev) => (prev ? { ...prev, total_records: 0, today_total_marks: 0, today_checked_in: 0, today_checked_out: 0 } : null));
+
     try {
       const res = await apiFetch('/api/records/clear', {
         method: 'POST',
@@ -225,6 +240,7 @@ export default function App() {
       }
     } catch (e) {
       console.error('Error clearing all records:', e);
+      fetchData();
     }
   };
 
