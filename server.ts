@@ -23,7 +23,7 @@ const ROLES_FILE = path.join(process.cwd(), "bot_roles.json");
 const SCHEDULE_FILE = path.join(process.cwd(), "schedule_config.json");
 const LOGS_FILE = path.join(process.cwd(), "bot_activity.log");
 
-// Safe helper to open and initialize SQLite DB if supported by Node runtime (Node 22.5+)
+// Safe helper to execute SQLite queries (using node:sqlite or python3 sqlite3 fallback)
 let cachedDb: any = null;
 let sqliteChecked = false;
 
@@ -87,6 +87,57 @@ function getDb(): any {
 
   sqliteChecked = true;
   return null;
+}
+
+// Unified SQLite execution function (works with node:sqlite or python3 fallback)
+function execSql(sql: string, params: any[] = []): any {
+  const db = getDb();
+  if (db) {
+    try {
+      const trimmed = sql.trim().toUpperCase();
+      if (trimmed.startsWith("SELECT")) {
+        return db.prepare(sql).all(...params);
+      } else {
+        return db.prepare(sql).run(...params);
+      }
+    } catch (e) {
+      console.error("node:sqlite exec error:", e);
+    }
+  }
+
+  // Python SQLite fallback (guaranteed to match bot.py SQLite instance)
+  try {
+    const pythonScript = `
+import sqlite3, json, sys
+conn = sqlite3.connect('${DB_FILE}')
+conn.row_factory = sqlite3.Row
+try:
+    conn.execute("PRAGMA journal_mode = WAL;")
+    conn.execute("PRAGMA busy_timeout = 5000;")
+except Exception:
+    pass
+cur = conn.cursor()
+sql = sys.argv[1]
+params = json.loads(sys.argv[2])
+cur.execute(sql, params)
+trimmed = sql.strip().upper()
+if trimmed.startswith("SELECT"):
+    rows = [dict(r) for r in cur.fetchall()]
+    print(json.dumps(rows))
+else:
+    conn.commit()
+    print(json.dumps({"changes": cur.rowcount, "lastrowid": cur.lastrowid}))
+`;
+    const output = child_process.execFileSync(
+      "python3",
+      ["-c", pythonScript, sql, JSON.stringify(params)],
+      { encoding: "utf-8", timeout: 5000 }
+    );
+    return JSON.parse(output.trim() || "null");
+  } catch (err) {
+    console.error("execSql Python fallback error:", err);
+    return null;
+  }
 }
 
 // Gemini AI client initialization
@@ -251,23 +302,21 @@ function addLogEntry(level: string, message: string) {
 
 // Data Helper Functions
 function readShiftRecords(): any[] {
-  const db = getDb();
-  if (db) {
-    try {
-      const rows = db.prepare("SELECT * FROM shift_records ORDER BY id ASC").all() as any[];
-      const safeRows = rows || [];
+  try {
+    const rows = execSql("SELECT * FROM shift_records ORDER BY id ASC");
+    if (Array.isArray(rows)) {
       // Keep JSON file synchronized
       try {
         fs.writeFileSync(
           DATA_FILE,
-          JSON.stringify({ records: safeRows, updated_at: new Date().toISOString() }, null, 2),
+          JSON.stringify({ records: rows, updated_at: new Date().toISOString() }, null, 2),
           "utf-8"
         );
       } catch (err) {}
-      return safeRows;
-    } catch (e) {
-      console.error("readShiftRecords DB error:", e);
+      return rows;
     }
+  } catch (e) {
+    console.error("readShiftRecords SQLite error:", e);
   }
 
   try {
@@ -520,18 +569,25 @@ app.post("/api/records", (req, res) => {
     created_at: `${recordDate} ${time}`,
   };
 
-  const db = getDb();
-  if (db) {
-    try {
-      db.prepare(`
-        INSERT INTO shift_records (id, chat_id, telegram_user_id, action, surname, time, time_line, raw_text, source, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        newRecord.id, newRecord.chat_id, newRecord.telegram_user_id, newRecord.action, newRecord.surname, newRecord.time, newRecord.time_line, newRecord.raw_text, newRecord.source, newRecord.created_at
-      );
-    } catch (e) {
-      console.error("Failed inserting into DB:", e);
-    }
+  try {
+    execSql(
+      `INSERT INTO shift_records (id, chat_id, telegram_user_id, action, surname, time, time_line, raw_text, source, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        newRecord.id,
+        newRecord.chat_id,
+        newRecord.telegram_user_id,
+        newRecord.action,
+        newRecord.surname,
+        newRecord.time,
+        newRecord.time_line,
+        newRecord.raw_text,
+        newRecord.source,
+        newRecord.created_at,
+      ]
+    );
+  } catch (e) {
+    console.error("Failed inserting into DB:", e);
   }
 
   const records = readShiftRecords();
@@ -547,16 +603,16 @@ app.post("/api/records", (req, res) => {
 // Delete Record
 app.delete("/api/records/:id", (req, res) => {
   const recordId = Number(req.params.id);
-  const db = getDb();
   let targetRecord: any = null;
 
-  if (db) {
-    try {
-      targetRecord = db.prepare("SELECT * FROM shift_records WHERE id = ?").get(recordId);
-      db.prepare("DELETE FROM shift_records WHERE id = ?").run(recordId);
-    } catch (e) {
-      console.error("Failed deleting record from DB:", e);
+  try {
+    const rows = execSql("SELECT * FROM shift_records WHERE id = ?", [recordId]);
+    if (Array.isArray(rows) && rows.length > 0) {
+      targetRecord = rows[0];
     }
+    execSql("DELETE FROM shift_records WHERE id = ?", [recordId]);
+  } catch (e) {
+    console.error("Failed deleting record from DB:", e);
   }
 
   let records = readShiftRecords();
@@ -573,13 +629,10 @@ app.delete("/api/records/:id", (req, res) => {
 
 // Clear All Shift Records (Batch Wipe for testing/cleanup)
 app.post("/api/records/clear", (req, res) => {
-  const db = getDb();
-  if (db) {
-    try {
-      db.prepare("DELETE FROM shift_records").run();
-    } catch (e) {
-      console.error("Failed clearing DB records:", e);
-    }
+  try {
+    execSql("DELETE FROM shift_records");
+  } catch (e) {
+    console.error("Failed clearing DB records:", e);
   }
 
   writeShiftRecords([]);
@@ -596,14 +649,11 @@ app.post("/api/records/batch-delete", (req, res) => {
 
   const numIds = ids.map(Number);
   const idSet = new Set(numIds);
-  const db = getDb();
-  if (db) {
-    try {
-      const placeholders = ids.map(() => "?").join(",");
-      db.prepare(`DELETE FROM shift_records WHERE id IN (${placeholders})`).run(...numIds);
-    } catch (e) {
-      console.error("Failed batch deleting from DB:", e);
-    }
+  try {
+    const placeholders = ids.map(() => "?").join(",");
+    execSql(`DELETE FROM shift_records WHERE id IN (${placeholders})`, numIds);
+  } catch (e) {
+    console.error("Failed batch deleting from DB:", e);
   }
 
   let records = readShiftRecords();

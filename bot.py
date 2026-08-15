@@ -718,7 +718,10 @@ async def show_today_marked(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT surname, action, time FROM shift_records WHERE created_at LIKE ? ORDER BY created_at ASC", (f"{today}%",))
+            cursor.execute(
+                "SELECT surname, action, time, created_at FROM shift_records WHERE created_at LIKE ? ORDER BY created_at ASC",
+                (f"{today}%",)
+            )
             records = cursor.fetchall()
     except Exception as e:
         logger.error(f"Error fetching today records: {e}")
@@ -741,7 +744,7 @@ async def show_today_marked(update: Update, context: ContextTypes.DEFAULT_TYPE):
             in_time = times.get("in") or "—"
             out_time = times.get("out") or "—"
             rows.append(f"• {surname} | 🟢 Приход: {in_time} | 🔴 Уход: {out_time}")
-        text = f"📊 Отметки сотрудников за {today}:\n\n" + "\n".join(rows)
+        text = f"📊 Отметки сотрудников за {today} (всего записей: {len(records)}):\n\n" + "\n".join(rows)
 
     buttons = [[InlineKeyboardButton("⬅️ Назад в админку", callback_data="back_to_admin")]]
     await reply_text(update, text, reply_markup=InlineKeyboardMarkup(buttons))
@@ -763,17 +766,27 @@ async def show_missing_marked(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.error(f"Error fetching missing records: {e}")
         records = []
 
-    checked_in = set()
-    checked_out = set()
+    checked_in_set = set()
+    checked_out_set = set()
     for rec in records:
-        s = rec["surname"]
+        s = (rec["surname"] or "").strip()
         if rec["action"] == "in":
-            checked_in.add(s)
+            checked_in_set.add(s)
         elif rec["action"] == "out":
-            checked_out.add(s)
+            checked_out_set.add(s)
 
-    missing_in = [s for s in users_map if s not in checked_in]
-    missing_out = [s for s in users_map if s not in checked_out]
+    def is_present(registered_name: str, target_set: set) -> bool:
+        if registered_name in target_set:
+            return True
+        reg_clean = registered_name.lower().split(".")[0].strip()
+        for item in target_set:
+            item_clean = item.lower().split(".")[0].strip()
+            if reg_clean and (reg_clean == item_clean or reg_clean in item_clean or item_clean in reg_clean):
+                return True
+        return False
+
+    missing_in = [s for s in users_map if not is_present(s, checked_in_set)]
+    missing_out = [s for s in users_map if not is_present(s, checked_out_set)]
 
     msg = f"⚠️ Статус отметок на {today}:\n\n"
     msg += "🟢 НЕ отметили приход:\n"
@@ -977,6 +990,66 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
+def analyze_image_with_gemini(image_path: str) -> dict | None:
+    """Analyze screenshot via Gemini Vision REST API (fast and robust fallback/primary analyzer)"""
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return None
+    try:
+        import base64
+        import urllib.request
+        with open(image_path, "rb") as f:
+            b64_data = base64.b64encode(f.read()).decode("utf-8")
+        
+        prompt = """You are an expert OCR and attendance verification system for employee mobile screenshots (RMAS Mobile or similar).
+Analyze the screenshot and return JSON strictly:
+1. Username: In RMAS Mobile, look at top header line right under 'RMAS Mobile ...' (e.g. 'eremin.n C941s' -> extract 'eremin.n') as 'surname'.
+2. Status bar clock: IGNORE phone status bar clock at the very top (black bar with battery/wifi).
+3. Check In (Приход): Indicated by GREEN timestamp above the buttons.
+4. Check Out (Уход): Indicated by RED timestamp below 'Check Out' button.
+5. When BOTH green timestamp (e.g. 11:28:53) AND red timestamp (e.g. 20:34:25) are present, the action is Check Out ('detected_action': 'out') and the shift time MUST be the RED timestamp ('20:34:25').
+6. When ONLY green timestamp is present (no red timestamp), the action is Check In ('detected_action': 'in') and shift time is this green timestamp.
+
+Return JSON format only:
+{
+  "surname": "eremin.n",
+  "time": "HH:MM:SS",
+  "detected_action": "in" or "out",
+  "raw_text": "..."
+}"""
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"inline_data": {"mime_type": "image/jpeg", "data": b64_data}},
+                        {"text": prompt}
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "response_mime_type": "application/json"
+            }
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "User-Agent": "ShiftBot/2.0"}
+        )
+        with urllib.request.urlopen(req, timeout=12) as response:
+            res_data = json.loads(response.read().decode("utf-8"))
+            candidates = res_data.get("candidates", [])
+            if candidates:
+                content = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "{}")
+                parsed = json.loads(content)
+                if parsed.get("time"):
+                    return parsed
+    except Exception as e:
+        logger.warning(f"Gemini Vision API in bot: {e}")
+    return None
+
+
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not update.message or not update.effective_chat:
         return
@@ -997,18 +1070,33 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Не удалось получить изображение. Пожалуйста, отправьте скриншот еще раз.")
         return
 
-    await update.message.reply_text("🔍 Обрабатываю скриншот, извлекаю время...")
+    await update.message.reply_text("🔍 Обрабатываю скриншот, извлекаю отметку...")
 
-    surname = get_surname_for_user(user_id)
+    chat_data = context.chat_data if context.chat_data is not None else {}
+    pending_action = chat_data.pop("pending_action", None)
+    caption = (msg.caption or "").lower()
+    if not pending_action:
+        if any(w in caption for w in ("уход", "выход", "out", "конец", "финиш")):
+            pending_action = "out"
+        elif any(w in caption for w in ("приход", "вход", "in", "старт", "начало")):
+            pending_action = "in"
+
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tf:
         temp_path = tf.name
 
+    gemini_result = None
+    time_lines = []
+    raw_text = ""
     img_rgb = None
+
     try:
         await file.download_to_drive(temp_path)
+
+        # 1. Primary Analyzer: Gemini Vision (if API key present)
+        gemini_result = analyze_image_with_gemini(temp_path)
+
+        # 2. Local OCR / Image processing for fallback or validation
         img = Image.open(temp_path)
-        
-        # Color extraction requires the RGB version of the image before grayscale
         img_rgb = img.convert("RGB")
         w, h = img_rgb.size
         if max(w, h) < 1500:
@@ -1017,7 +1105,6 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
         raw_text = run_tesseract(img)
         
-        # Also run image_to_data for color extraction
         ocr_data = None
         if TESSERACT_CMD and PYTESSERACT_AVAILABLE:
             try:
@@ -1027,84 +1114,101 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"Error running image_to_data: {e}")
 
+        time_lines = extract_time_lines(raw_text, ocr_data, img_rgb)
+
     except Exception as e:
         logger.error(f"Error processing uploaded image: {e}")
-        raw_text = ""
-        ocr_data = None
-        img_rgb = None
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
-    time_lines = extract_time_lines(raw_text, ocr_data, img_rgb)
+    # Determine action and time
+    action = pending_action
+    time_value = None
+    final_surname = None
+    resolution_source = "unknown"
+    time_line_str = ""
 
-    # Count valid shift timestamps (excluding top phone status bar)
-    has_seconds = any(len(tl["time"].split(":")) == 3 and not looks_like_status_bar(tl.get("line", ""), tl.get("line_index", 0)) for tl in time_lines)
-    
-    valid_shift_times = []
-    for tl in time_lines:
-        if looks_like_status_bar(tl.get("line", ""), tl.get("line_index", 0)):
-            continue
-        if has_seconds and len(tl["time"].split(":")) < 3:
-            continue
-        valid_shift_times.append(tl["time"])
-
-    distinct_times = list(dict.fromkeys(valid_shift_times))
-
-    # Simplified Rule:
-    # 1 timestamp on screenshot -> Check In ("in")
-    # 2 or more timestamps on screenshot -> Check Out ("out", will pick the latest/maximum time)
-    if len(distinct_times) >= 2:
-        action = "out"
-    elif len(distinct_times) == 1:
-        action = "in"
+    if gemini_result and gemini_result.get("time"):
+        time_value = gemini_result.get("time")
+        detected_action = gemini_result.get("detected_action", "in")
+        action = pending_action or detected_action
+        cand_surname = gemini_result.get("surname", "")
+        if cand_surname:
+            final_surname, resolution_source = extract_and_verify_surname(cand_surname, user_id)
+        raw_text = gemini_result.get("raw_text", raw_text)
+        time_line_str = f"Gemini Vision: {time_value} ({action.upper()})"
     else:
-        lower_text = raw_text.lower()
-        if any(k in lower_text for k in ("check out", "уход", "выход", "финиш", "завершить")):
-            action = "out"
-        elif any(k in lower_text for k in ("check in", "приход", "вход", "старт", "начать")):
-            action = "in"
-        else:
-            today = get_current_time().date().isoformat()
-            try:
-                with get_db_connection() as conn:
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        "SELECT action FROM shift_records WHERE telegram_user_id = ? AND created_at LIKE ? ORDER BY id DESC LIMIT 1",
-                        (user_id, f"{today}%")
-                    )
-                    last_record = cursor.fetchone()
-                    if last_record and last_record["action"] == "in":
-                        action = "out"
-                    else:
-                        action = "in"
-            except Exception:
-                action = "in"
+        # Local OCR fallback
+        has_seconds = any(len(tl["time"].split(":")) == 3 and not looks_like_status_bar(tl.get("line", ""), tl.get("line_index", 0)) for tl in time_lines)
+        valid_shift_times = []
+        for tl in time_lines:
+            if looks_like_status_bar(tl.get("line", ""), tl.get("line_index", 0)):
+                continue
+            if has_seconds and len(tl["time"].split(":")) < 3:
+                continue
+            valid_shift_times.append(tl["time"])
 
-    parsed = parse_text(time_lines, raw_text, action, user_id)
-    time_value = parsed.get("time")
+        distinct_times = list(dict.fromkeys(valid_shift_times))
+
+        # Action resolution in local fallback
+        if not action:
+            if any(tl.get("color") == "red" for tl in time_lines):
+                action = "out"
+            elif len(distinct_times) >= 2:
+                action = "out"
+            elif len(distinct_times) == 1:
+                action = "in"
+            else:
+                lower_text = raw_text.lower()
+                if any(k in lower_text for k in ("check out", "уход", "выход", "финиш", "завершить")):
+                    action = "out"
+                elif any(k in lower_text for k in ("check in", "приход", "вход", "старт", "начать")):
+                    action = "in"
+                else:
+                    today = get_current_time().date().isoformat()
+                    try:
+                        with get_db_connection() as conn:
+                            cursor = conn.cursor()
+                            cursor.execute(
+                                "SELECT action FROM shift_records WHERE telegram_user_id = ? AND created_at LIKE ? ORDER BY id DESC LIMIT 1",
+                                (user_id, f"{today}%")
+                            )
+                            last_record = cursor.fetchone()
+                            if last_record and last_record["action"] == "in":
+                                action = "out"
+                            else:
+                                action = "in"
+                    except Exception:
+                        action = "in"
+
+        parsed = parse_text(time_lines, raw_text, action, user_id)
+        time_value = parsed.get("time")
+        final_surname = parsed.get("surname")
+        resolution_source = parsed.get("resolution_source", "unknown")
+        time_line_str = parsed.get("time_line", "")
 
     if not time_value:
         await update.message.reply_text(
             "⚠️ Не удалось распознать точное время на скриншоте.\n"
-            "Убедитесь, что время на скриншоте четко видно."
+            "Пожалуйста, убедитесь, что скриншот чёткий и не обрезан."
         )
         return
 
-    final_surname = parsed.get("surname") or get_surname_for_user(user_id) or f"User_{user_id}"
-    resolution_source = parsed.get("resolution_source", "unknown")
+    if not final_surname or final_surname == "Unknown":
+        final_surname = get_surname_for_user(user_id) or f"User_{user_id}"
 
-    # Duplicate submission guard: prevent accidental double-uploads
+    # Duplicate submission guard: only block exact duplicates of SAME action and SAME time today
     today = get_current_time().date().isoformat()
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT id, action, time, created_at FROM shift_records WHERE telegram_user_id = ? AND created_at LIKE ? ORDER BY id DESC LIMIT 1",
-                (user_id, f"{today}%")
+                "SELECT id, action, time, created_at FROM shift_records WHERE telegram_user_id = ? AND action = ? AND time = ? AND created_at LIKE ? ORDER BY id DESC LIMIT 1",
+                (user_id, action, time_value, f"{today}%")
             )
             prev = cursor.fetchone()
-            if prev and prev["action"] == action and prev["time"] == time_value:
+            if prev:
                 action_label = "🟢 Приход" if action == "in" else "🔴 Уход"
                 await update.message.reply_text(
                     f"ℹ️ Отметка {action_label} со временем {time_value} уже зафиксирована в системе ранее ({prev['created_at']}).\n"
@@ -1121,8 +1225,8 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "action": action,
         "surname": final_surname,
         "time": time_value,
-        "time_line": parsed.get("time_line", ""),
-        "raw_text": parsed.get("raw_text", ""),
+        "time_line": time_line_str,
+        "raw_text": raw_text.strip(),
         "source": "telegram_ocr",
         "created_at": get_current_time().isoformat(sep=" ", timespec="seconds")
     }
@@ -1138,8 +1242,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if resolution_source == "telegram_id_fallback":
             msg_text += (
-                "\n\nℹ️ *Примечание:* Имя на скриншоте не распознано или не найдено в БД, "
-                "поэтому отметка автоматически привязана к вашему профилю по Telegram ID."
+                "\n\nℹ️ *Примечание:* Имя на скриншоте привязано к вашему профилю по Telegram ID."
             )
         await update.message.reply_text(msg_text, parse_mode="Markdown")
     else:
