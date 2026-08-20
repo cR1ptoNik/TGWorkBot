@@ -26,6 +26,15 @@ export interface RoleMap {
   user: Record<string, number>;
 }
 
+export interface EmployeeScheduleItem {
+  work_days: number[]; // [1..7] where 1 = Monday (Пн), 7 = Sunday (Вс)
+  vacation_start?: string | null; // "YYYY-MM-DD"
+  vacation_end?: string | null; // "YYYY-MM-DD"
+  shift_start?: string;
+  shift_end?: string;
+  notes?: string;
+}
+
 export interface ScheduleConfig {
   shift_start: string;
   shift_end: string;
@@ -33,6 +42,7 @@ export interface ScheduleConfig {
   remind_before_start_minutes: number;
   remind_after_end_minutes: number;
   enabled: boolean;
+  employee_schedules?: Record<string, EmployeeScheduleItem>;
 }
 
 export interface OcrResult {

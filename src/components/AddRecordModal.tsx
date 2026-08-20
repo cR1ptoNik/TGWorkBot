@@ -1,11 +1,11 @@
 import React, { useState } from 'react';
-import { X, Plus, LogIn, LogOut, Clock, User } from 'lucide-react';
+import { X, Plus, LogIn, LogOut, Clock, User, AlertTriangle, ShieldAlert } from 'lucide-react';
 import { triggerHaptic } from '../lib/api';
 
 interface AddRecordModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onSave: (record: { surname: string; action: 'in' | 'out'; time: string; notes: string; date: string }) => Promise<void>;
+  onSave: (record: { surname: string; action: 'in' | 'out'; time: string; notes: string; date: string; bypass_honesty?: boolean }) => Promise<{ success?: boolean; error?: string; is_honesty_error?: boolean }>;
 }
 
 export const AddRecordModal: React.FC<AddRecordModalProps> = ({ isOpen, onClose, onSave }) => {
@@ -15,21 +15,39 @@ export const AddRecordModal: React.FC<AddRecordModalProps> = ({ isOpen, onClose,
   const [date, setDate] = useState(new Date().toISOString().split('T')[0]);
   const [notes, setNotes] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [honestyError, setHonestyError] = useState<string | null>(null);
 
   if (!isOpen) return null;
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent, forceBypass: boolean = false) => {
     e.preventDefault();
     if (!surname || !time) return;
 
     setSubmitting(true);
+    setHonestyError(null);
     try {
-      await onSave({ surname: surname.trim(), action, time: time.trim(), notes: notes.trim(), date });
-      triggerHaptic('success');
-      onClose();
-    } catch (e) {
+      const res = await onSave({
+        surname: surname.trim(),
+        action,
+        time: time.trim(),
+        notes: notes.trim(),
+        date,
+        bypass_honesty: forceBypass,
+      });
+
+      if (res && res.is_honesty_error) {
+        setHonestyError(res.error || 'Обнаружено совпадение времени с ранее зафиксированной отметкой за последние 7 дней.');
+        triggerHaptic('error');
+      } else if (res && res.error) {
+        setHonestyError(res.error);
+        triggerHaptic('error');
+      } else {
+        triggerHaptic('success');
+        onClose();
+      }
+    } catch (e: any) {
       triggerHaptic('error');
-      console.error(e);
+      setHonestyError(e.message || 'Ошибка сохранения отметки');
     } finally {
       setSubmitting(false);
     }
@@ -52,7 +70,30 @@ export const AddRecordModal: React.FC<AddRecordModalProps> = ({ isOpen, onClose,
           </button>
         </div>
 
-        <form onSubmit={handleSubmit} className="p-5 space-y-4">
+        <form onSubmit={(e) => handleSubmit(e, false)} className="p-5 space-y-4">
+          {honestyError && (
+            <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl space-y-2">
+              <div className="flex items-start gap-2 text-rose-800 text-xs">
+                <ShieldAlert className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                <div>
+                  <p className="font-bold uppercase tracking-wider text-[10px] text-rose-600">Проверка честности (7 дней)</p>
+                  <p className="mt-0.5 leading-relaxed">{honestyError}</p>
+                </div>
+              </div>
+              <div className="pt-2 border-t border-rose-200 flex justify-end">
+                <button
+                  type="button"
+                  id="force-bypass-btn"
+                  onClick={(e) => handleSubmit(e, true)}
+                  disabled={submitting}
+                  className="text-[11px] font-bold text-rose-700 bg-rose-100 hover:bg-rose-200 px-3 py-1.5 rounded transition-colors"
+                >
+                  Админ-пропуск: Сохранить принудительно
+                </button>
+              </div>
+            </div>
+          )}
+
           <div>
             <label className="block text-[10px] uppercase font-bold text-slate-400 tracking-wider mb-1">Фамилия / Имя сотрудника</label>
             <div className="relative">
@@ -63,7 +104,10 @@ export const AddRecordModal: React.FC<AddRecordModalProps> = ({ isOpen, onClose,
                 required
                 placeholder="например: Иванов.А.В"
                 value={surname}
-                onChange={(e) => setSurname(e.target.value)}
+                onChange={(e) => {
+                  setSurname(e.target.value);
+                  setHonestyError(null);
+                }}
                 className="w-full pl-9 pr-3 py-2 text-xs border border-slate-200 rounded focus:outline-hidden focus:border-cyan-500"
               />
             </div>
@@ -116,7 +160,7 @@ export const AddRecordModal: React.FC<AddRecordModalProps> = ({ isOpen, onClose,
             </div>
 
             <div>
-              <label className="block text-[10px] uppercase font-bold text-slate-400 tracking-wider mb-1">Время (ЧЧ:ММ:СС)</label>
+              <label className="block text-[10px] uppercase font-bold text-slate-400 tracking-wider mb-1">Время с точностью до секунд (ЧЧ:ММ:СС)</label>
               <div className="relative">
                 <Clock className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
                 <input
@@ -125,7 +169,10 @@ export const AddRecordModal: React.FC<AddRecordModalProps> = ({ isOpen, onClose,
                   required
                   placeholder="08:30:00"
                   value={time}
-                  onChange={(e) => setTime(e.target.value)}
+                  onChange={(e) => {
+                    setTime(e.target.value);
+                    setHonestyError(null);
+                  }}
                   className="w-full pl-9 pr-3 py-2 text-xs border border-slate-200 rounded font-mono focus:outline-hidden focus:border-cyan-500"
                 />
               </div>

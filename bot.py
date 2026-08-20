@@ -1198,26 +1198,55 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not final_surname or final_surname == "Unknown":
         final_surname = get_surname_for_user(user_id) or f"User_{user_id}"
 
-    # Duplicate submission guard: only block exact duplicates of SAME action and SAME time today
-    today = get_current_time().date().isoformat()
+    # --- Honesty Check (Проверка честности за последние 7 дней) ---
+    # Check if exact timestamp with seconds (HH:MM:SS) has already been submitted by this employee or anyone else in last 7 days
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
+            seven_days_ago = (get_current_time().date() - timedelta(days=7)).isoformat()
             cursor.execute(
-                "SELECT id, action, time, created_at FROM shift_records WHERE telegram_user_id = ? AND action = ? AND time = ? AND created_at LIKE ? ORDER BY id DESC LIMIT 1",
-                (user_id, action, time_value, f"{today}%")
+                """
+                SELECT id, surname, action, time, created_at, telegram_user_id
+                FROM shift_records
+                WHERE time = ? AND created_at >= ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (time_value, f"{seven_days_ago} 00:00:00")
             )
-            prev = cursor.fetchone()
-            if prev:
-                action_label = "🟢 Приход" if action == "in" else "🔴 Уход"
-                await update.message.reply_text(
-                    f"ℹ️ Отметка {action_label} со временем {time_value} уже зафиксирована в системе ранее ({prev['created_at']}).\n"
-                    f"Повторное сохранение не требуется!"
+            duplicate_record = cursor.fetchone()
+
+            if duplicate_record:
+                dup_surname = duplicate_record["surname"] or "Неизвестный сотрудник"
+                dup_action = "🟢 Приход" if duplicate_record["action"] == "in" else "🔴 Уход"
+                dup_created = duplicate_record["created_at"]
+                is_same_person = (duplicate_record["telegram_user_id"] == user_id) or (duplicate_record["surname"] == final_surname)
+
+                log_audit_event(
+                    "WARNING",
+                    "HONESTY_CHECK_FAILED",
+                    f"Duplicate time '{time_value}' detected for user {final_surname} (ID: {user_id}). Previously used by {dup_surname} at {dup_created}.",
+                    user_id=user_id
                 )
+
+                if is_same_person:
+                    error_msg = (
+                        f"⛔️ **Ошибка проверки честности!**\n\n"
+                        f"Точное время **{time_value}** уже было зафиксировано вами ранее (**{dup_created}**, действие: {dup_action}).\n\n"
+                        f"⚠️ Повторная отправка одного и того же скриншота запрещена!"
+                    )
+                else:
+                    error_msg = (
+                        f"⛔️ **Ошибка проверки честности!**\n\n"
+                        f"Точное время **{time_value}** уже было отправлено другим сотрудником (**{dup_surname}**, {dup_created}).\n\n"
+                        f"⚠️ Использование чужих скриншотов запрещено!"
+                    )
+
+                await update.message.reply_text(error_msg, parse_mode="Markdown")
                 await send_main_menu(update, context)
                 return
     except Exception as e:
-        logger.error(f"Duplicate check error: {e}")
+        logger.error(f"Honesty check query error: {e}")
 
     record = {
         "chat_id": update.effective_chat.id,
@@ -1287,13 +1316,46 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ У вас нет доступа к панели администратора.")
 
 
+def is_employee_working_today(surname: str, cfg: dict, now: datetime) -> tuple[bool, str]:
+    """
+    Checks if employee should work today based on work_days schedule and vacation dates.
+    Returns (is_working: bool, reason: str)
+    """
+    emp_schedules = cfg.get("employee_schedules", {})
+    emp_cfg = emp_schedules.get(surname, {})
+    
+    # 1. Check vacation period
+    vac_start = emp_cfg.get("vacation_start")
+    vac_end = emp_cfg.get("vacation_end")
+    today_str = now.strftime("%Y-%m-%d")
+    
+    if vac_start and vac_end:
+        if vac_start <= today_str <= vac_end:
+            return False, f"🏖 Отпуск (с {vac_start} по {vac_end})"
+            
+    # 2. Check work days of week (1 = Monday, 7 = Sunday)
+    iso_weekday = now.isoweekday()
+    work_days = emp_cfg.get("work_days")
+    if work_days is None:
+        work_days = [1, 2, 3, 4, 5]  # Default 5/2 (Mon-Fri)
+    elif not isinstance(work_days, list):
+        work_days = [1, 2, 3, 4, 5]
+        
+    if iso_weekday not in work_days:
+        day_names = {1: "Пн", 2: "Вт", 3: "Ср", 4: "Чт", 5: "Пт", 6: "Сб", 7: "Вс"}
+        cur_day_name = day_names.get(iso_weekday, str(iso_weekday))
+        return False, f"☕️ Выходной день ({cur_day_name})"
+        
+    return True, "Рабочий день"
+
+
 # --- Automatic Reminders Engine ---
 
 async def reminder_scheduler_loop(bot):
     """
     Background worker checking every 30s for shift start/end reminders:
-    - Shift start window: remind users who haven't checked in today
-    - Shift end window: remind users who haven't checked out today
+    - Shift start window: remind users who haven't checked in today (skipping days off and vacations)
+    - Shift end window: remind users who haven't checked out today (skipping days off and vacations)
     """
     logger.info("Starting automatic shift reminder scheduler loop...")
     while True:
@@ -1340,6 +1402,12 @@ async def reminder_scheduler_loop(bot):
 
                     for surname, udata in users_map.items():
                         uid = udata["telegram_user_id"]
+
+                        # Check if employee works today or is on vacation/day off
+                        is_working, status_reason = is_employee_working_today(surname, cfg, now)
+                        if not is_working:
+                            continue
+
                         if uid not in checked_in_ids:
                             # Check if reminder already sent today
                             cursor.execute("SELECT id FROM sent_reminders WHERE date=? AND reminder_type='start' AND telegram_user_id=?", (today_str, uid))
@@ -1376,6 +1444,12 @@ async def reminder_scheduler_loop(bot):
 
                     for surname, udata in users_map.items():
                         uid = udata["telegram_user_id"]
+
+                        # Check if employee works today or is on vacation/day off
+                        is_working, status_reason = is_employee_working_today(surname, cfg, now)
+                        if not is_working:
+                            continue
+
                         if uid not in checked_out_ids:
                             cursor.execute("SELECT id FROM sent_reminders WHERE date=? AND reminder_type='end' AND telegram_user_id=?", (today_str, uid))
                             if not cursor.fetchone():

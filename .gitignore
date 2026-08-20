@@ -7,3 +7,10 @@ coverage/
 *.db
 .env*
 !.env.example
+# Data and persistence files (Never overwrite user data during git pull)
+shift_attendance.db*
+shift_attendance.json
+bot_roles.json
+schedule_config.json
+bot_activity.log
+

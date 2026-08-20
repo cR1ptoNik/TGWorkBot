@@ -11,7 +11,7 @@ import { BotCodeReview } from './components/BotCodeReview';
 import { IndividualCharts } from './components/IndividualCharts';
 import { EmployeeWebAppView } from './components/EmployeeWebAppView';
 import { AddRecordModal } from './components/AddRecordModal';
-import { ShiftRecord, AuditLog, RoleMap, SystemStats } from './types';
+import { ShiftRecord, AuditLog, RoleMap, SystemStats, ScheduleConfig } from './types';
 import { apiFetch } from './lib/api';
 
 export default function App() {
@@ -20,6 +20,7 @@ export default function App() {
   const [records, setRecords] = useState<ShiftRecord[]>([]);
   const [logs, setLogs] = useState<AuditLog[]>([]);
   const [roles, setRoles] = useState<RoleMap | null>(null);
+  const [schedule, setSchedule] = useState<ScheduleConfig | null>(null);
   const [botCode, setBotCode] = useState<string>('');
   const [loading, setLoading] = useState(false);
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
@@ -106,12 +107,13 @@ export default function App() {
   const fetchData = async () => {
     setLoading(true);
     try {
-      const [statsRes, recordsRes, logsRes, rolesRes, codeRes] = await Promise.all([
+      const [statsRes, recordsRes, logsRes, rolesRes, codeRes, scheduleRes] = await Promise.all([
         apiFetch('/api/stats'),
         apiFetch('/api/records'),
         apiFetch('/api/logs'),
         apiFetch('/api/roles'),
         apiFetch('/api/bot-code'),
+        apiFetch('/api/schedule'),
       ]);
 
       if (statsRes.ok) setStats(await statsRes.json());
@@ -127,6 +129,9 @@ export default function App() {
       if (codeRes.ok) {
         const data = await codeRes.json();
         setBotCode(data.code || '');
+      }
+      if (scheduleRes.ok) {
+        setSchedule(await scheduleRes.json());
       }
     } catch (err) {
       console.error('Error fetching data:', err);
@@ -145,6 +150,7 @@ export default function App() {
     time: string;
     notes: string;
     date: string;
+    bypass_honesty?: boolean;
   }) => {
     try {
       const res = await apiFetch('/api/records', {
@@ -152,11 +158,19 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(recordData),
       });
-      if (res.ok) {
-        fetchData();
+      const data = await res.json();
+      if (!res.ok) {
+        return {
+          success: false,
+          error: data.error || 'Ошибка при сохранении отметки',
+          is_honesty_error: !!data.is_honesty_error,
+        };
       }
-    } catch (e) {
+      fetchData();
+      return { success: true };
+    } catch (e: any) {
       console.error('Error adding record:', e);
+      return { success: false, error: e.message || 'Сетевая ошибка' };
     }
   };
 
@@ -179,10 +193,13 @@ export default function App() {
           date: new Date().toISOString().split('T')[0],
         }),
       });
-      if (res.ok) {
-        fetchData();
-        setActiveTab('attendance');
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.error || 'Ошибка при сохранении OCR отметки');
+        return;
       }
+      fetchData();
+      setActiveTab('attendance');
     } catch (e) {
       console.error('Error adding OCR record:', e);
     }
@@ -320,6 +337,7 @@ export default function App() {
             {activeTab === 'attendance' && (
               <AttendanceTable
                 records={records}
+                schedule={schedule}
                 loading={loading}
                 onRefresh={fetchData}
                 onOpenAddModal={() => setIsAddModalOpen(true)}
@@ -349,10 +367,11 @@ export default function App() {
                 roles={roles}
                 onUpdateRole={handleUpdateRole}
                 onDeleteRole={handleDeleteRole}
+                onRefreshAll={fetchData}
               />
             )}
 
-            {activeTab === 'schedule' && <ScheduleManager />}
+            {activeTab === 'schedule' && <ScheduleManager onScheduleUpdated={fetchData} />}
 
             {activeTab === 'code' && (
               <BotCodeReview botCode={botCode} />

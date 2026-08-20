@@ -1,10 +1,11 @@
 import React, { useState } from 'react';
 import { Search, Plus, Trash2, Download, LogIn, LogOut, AlertCircle, RefreshCw, CheckSquare, Square, Calendar, Clock, AlertTriangle, CheckCircle2 } from 'lucide-react';
-import { ShiftRecord } from '../types';
+import { ShiftRecord, ScheduleConfig } from '../types';
 import { triggerHaptic } from '../lib/api';
 
 interface AttendanceTableProps {
   records: ShiftRecord[];
+  schedule?: ScheduleConfig | null;
   loading: boolean;
   onRefresh: () => void;
   onOpenAddModal: () => void;
@@ -15,6 +16,7 @@ interface AttendanceTableProps {
 
 export const AttendanceTable: React.FC<AttendanceTableProps> = ({
   records,
+  schedule,
   loading,
   onRefresh,
   onOpenAddModal,
@@ -102,12 +104,36 @@ export const AttendanceTable: React.FC<AttendanceTableProps> = ({
     }
   };
 
+  const shiftStart = schedule?.shift_start || '09:00';
+  const shiftEnd = schedule?.shift_end || '18:00';
+
+  // Helper to accurately detect late check-in based on configured shift schedule
+  function checkLateness(timeStr: string): { isLate: boolean; lateMinutes: number } {
+    if (!timeStr) return { isLate: false, lateMinutes: 0 };
+    const parts = timeStr.split(':');
+    const startParts = shiftStart.split(':');
+    if (parts.length >= 2 && startParts.length >= 2) {
+      const h = parseInt(parts[0], 10);
+      const m = parseInt(parts[1], 10);
+      const sh = parseInt(startParts[0], 10);
+      const sm = parseInt(startParts[1], 10);
+      if (!isNaN(h) && !isNaN(m) && !isNaN(sh) && !isNaN(sm)) {
+        const checkInMinutes = h * 60 + m;
+        const startMinutes = sh * 60 + sm;
+        if (checkInMinutes > startMinutes) {
+          return { isLate: true, lateMinutes: checkInMinutes - startMinutes };
+        }
+      }
+    }
+    return { isLate: false, lateMinutes: 0 };
+  }
+
   const exportCSV = () => {
     triggerHaptic('success');
     const headers = ['ID', 'Дата и время записи', 'Фамилия сотрудника', 'Действие', 'Время на скриншоте', 'Статус смены', 'Источник', 'Строка распознавания'];
     const rows = filtered.map((r) => {
-      const isLate = r.action === 'in' && isLateCheckIn(r.time);
-      const statusLabel = r.action === 'in' ? (isLate ? 'ОПОЗДАНИЕ' : 'ВОВРЕМЯ') : 'УХОД';
+      const { isLate, lateMinutes } = r.action === 'in' ? checkLateness(r.time) : { isLate: false, lateMinutes: 0 };
+      const statusLabel = r.action === 'in' ? (isLate ? `ОПОЗДАНИЕ (+${lateMinutes} мин)` : 'ВОВРЕМЯ') : 'УХОД';
       return [
         r.id,
         `"${r.created_at}"`,
@@ -135,28 +161,18 @@ export const AttendanceTable: React.FC<AttendanceTableProps> = ({
     URL.revokeObjectURL(url);
   };
 
-  // Helper to detect late check-in (e.g. after 09:05)
-  function isLateCheckIn(timeStr: string): boolean {
-    if (!timeStr) return false;
-    const parts = timeStr.split(':');
-    if (parts.length >= 2) {
-      const h = parseInt(parts[0], 10);
-      const m = parseInt(parts[1], 10);
-      if (!isNaN(h) && !isNaN(m)) {
-        const totalMinutes = h * 60 + m;
-        // 09:05 = 545 minutes
-        return totalMinutes > 545;
-      }
-    }
-    return false;
-  }
-
   return (
     <div id="attendance-section" className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-xs">
       {/* Activity Header */}
       <div className="bg-slate-50 px-6 py-4 border-b border-slate-200 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
         <div>
-          <h2 className="font-bold text-xs uppercase tracking-widest text-slate-600">Лента активности смен</h2>
+          <div className="flex items-center gap-2">
+            <h2 className="font-bold text-xs uppercase tracking-widest text-slate-600">Лента активности смен</h2>
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-cyan-50 text-cyan-700 border border-cyan-200" title="Текущий настроенный график работы">
+              <Clock className="w-3 h-3 text-cyan-600" />
+              График: {shiftStart} – {shiftEnd}
+            </span>
+          </div>
           <p className="text-[11px] text-slate-400 mt-0.5">Журнал посещаемости и верификации в реальном времени (SQLite)</p>
         </div>
 
@@ -352,7 +368,7 @@ export const AttendanceTable: React.FC<AttendanceTableProps> = ({
               filtered.map((record) => {
                 const isIn = record.action === 'in';
                 const isSelected = selectedIds.includes(record.id);
-                const isLate = isIn && isLateCheckIn(record.time);
+                const { isLate, lateMinutes } = isIn ? checkLateness(record.time) : { isLate: false, lateMinutes: 0 };
 
                 return (
                   <tr
@@ -406,14 +422,20 @@ export const AttendanceTable: React.FC<AttendanceTableProps> = ({
                     <td className="px-4 py-4 text-xs">
                       {isIn ? (
                         isLate ? (
-                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-amber-50 text-amber-700 border border-amber-200">
+                          <span
+                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-amber-50 text-amber-700 border border-amber-200"
+                            title={`Начало смены: ${shiftStart}. Опоздание на ${lateMinutes} мин.`}
+                          >
                             <AlertTriangle className="w-3 h-3 text-amber-500" />
-                            Опоздание (&gt; 09:05)
+                            Опоздание (+{lateMinutes} мин)
                           </span>
                         ) : (
-                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
+                          <span
+                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200"
+                            title={`Начало смены: ${shiftStart}. Приход вовремя.`}
+                          >
                             <CheckCircle2 className="w-3 h-3 text-emerald-500" />
-                            Вовремя
+                            Вовремя (до {shiftStart})
                           </span>
                         )
                       ) : (

@@ -546,9 +546,9 @@ app.get("/api/records", (req, res) => {
   res.json({ count: records.length, records });
 });
 
-// Add Manual Shift Record
+// Add Manual Shift Record with Honesty Check
 app.post("/api/records", (req, res) => {
-  const { surname, action, time, notes, date } = req.body;
+  const { surname, action, time, notes, date, bypass_honesty } = req.body;
 
   if (!surname || !action || !time) {
     return res.status(400).json({ error: "Surname, action, and time are required." });
@@ -556,17 +556,55 @@ app.post("/api/records", (req, res) => {
 
   const { dateStr } = getAdjustedDate();
   const recordDate = date || dateStr;
+  const trimmedTime = time.trim();
+  const trimmedSurname = surname.trim();
+
+  // --- Honesty Check (Проверка честности за последние 7 дней) ---
+  // Ensure the exact time (with seconds) has not been logged by same or other user in last 7 days
+  if (!bypass_honesty) {
+    try {
+      const records = readShiftRecords();
+      const sevenDaysAgoDate = new Date();
+      sevenDaysAgoDate.setDate(sevenDaysAgoDate.getDate() - 7);
+      const sevenDaysAgoStr = sevenDaysAgoDate.toISOString().split("T")[0];
+
+      const duplicate = records.find((r: any) => {
+        if (!r.time || !r.created_at) return false;
+        const rDate = r.created_at.split(" ")[0];
+        return r.time === trimmedTime && rDate >= sevenDaysAgoStr;
+      });
+
+      if (duplicate) {
+        const isSame = duplicate.surname?.toLowerCase() === trimmedSurname.toLowerCase();
+        const dupAction = duplicate.action === "in" ? "Приход" : "Уход";
+        const reason = isSame
+          ? `Точное время ${trimmedTime} уже было зафиксировано вами ранее (${duplicate.created_at}, ${dupAction}). Повторная отправка скриншотов запрещена.`
+          : `Точное время ${trimmedTime} уже использовалось сотрудником ${duplicate.surname} (${duplicate.created_at}). Использование чужих скриншотов запрещено.`;
+
+        addLogEntry("WARNING", `HONESTY_CHECK_FAILED: Duplicate time '${trimmedTime}' rejected for ${trimmedSurname}. Match: ${duplicate.surname} (${duplicate.created_at})`);
+
+        return res.status(409).json({
+          error: reason,
+          is_honesty_error: true,
+          duplicate_record: duplicate,
+        });
+      }
+    } catch (e) {
+      console.error("Honesty check error in /api/records:", e);
+    }
+  }
+
   const newRecord = {
     id: Date.now(),
     chat_id: 1000 + Math.floor(Math.random() * 9000),
     telegram_user_id: 123456789,
     action: action === "out" ? "out" : "in",
-    surname: surname.trim(),
-    time: time.trim(),
-    time_line: `Manual Log: ${time}`,
+    surname: trimmedSurname,
+    time: trimmedTime,
+    time_line: `Manual Log: ${trimmedTime}`,
     raw_text: notes || "Added via Web Dashboard",
     source: "web_manual",
-    created_at: `${recordDate} ${time}`,
+    created_at: `${recordDate} ${trimmedTime}`,
   };
 
   try {
@@ -892,7 +930,7 @@ app.get("/api/schedule", (req, res) => {
 
 // Update Shift Schedule
 app.post("/api/schedule", (req, res) => {
-  const { shift_start, shift_end, tz_offset_hours, remind_before_start_minutes, remind_after_end_minutes, enabled } = req.body;
+  const { shift_start, shift_end, tz_offset_hours, remind_before_start_minutes, remind_after_end_minutes, enabled, employee_schedules } = req.body;
   const current = readScheduleConfig();
   const updated = {
     ...current,
@@ -902,10 +940,88 @@ app.post("/api/schedule", (req, res) => {
     remind_before_start_minutes: remind_before_start_minutes ?? current.remind_before_start_minutes,
     remind_after_end_minutes: remind_after_end_minutes ?? current.remind_after_end_minutes,
     enabled: enabled ?? current.enabled,
+    employee_schedules: employee_schedules !== undefined ? employee_schedules : (current.employee_schedules || {}),
   };
   writeScheduleConfig(updated);
   addLogEntry("INFO", `SCHEDULE_UPDATED: Updated schedule (Start=${updated.shift_start}, End=${updated.shift_end}, UTC+${updated.tz_offset_hours})`);
   res.json({ success: true, schedule: updated });
+});
+
+// Update Individual Employee Schedule (work days, custom times)
+app.post("/api/schedule/employee", (req, res) => {
+  const { surname, work_days, vacation_start, vacation_end, shift_start, shift_end, notes } = req.body;
+  if (!surname) {
+    return res.status(400).json({ error: "Surname is required." });
+  }
+
+  const current = readScheduleConfig();
+  if (!current.employee_schedules) {
+    current.employee_schedules = {};
+  }
+
+  const prevEmp = current.employee_schedules[surname] || { work_days: [1, 2, 3, 4, 5] };
+  current.employee_schedules[surname] = {
+    ...prevEmp,
+    work_days: Array.isArray(work_days) ? work_days : (prevEmp.work_days || [1, 2, 3, 4, 5]),
+    vacation_start: vacation_start !== undefined ? vacation_start : (prevEmp.vacation_start || null),
+    vacation_end: vacation_end !== undefined ? vacation_end : (prevEmp.vacation_end || null),
+    shift_start: shift_start !== undefined ? shift_start : prevEmp.shift_start,
+    shift_end: shift_end !== undefined ? shift_end : prevEmp.shift_end,
+    notes: notes !== undefined ? notes : prevEmp.notes,
+  };
+
+  writeScheduleConfig(current);
+  addLogEntry("INFO", `EMPLOYEE_SCHEDULE_UPDATED: Updated individual schedule for ${surname} (Days: ${current.employee_schedules[surname].work_days?.join(",")}, Vacation: ${vacation_start || "none"} - ${vacation_end || "none"})`);
+  res.json({ success: true, schedule: current, employeeSchedule: current.employee_schedules[surname] });
+});
+
+// Set or Clear Employee Vacation
+app.post("/api/schedule/employee/vacation", (req, res) => {
+  const { surname, clear, days, vacation_start, vacation_end } = req.body;
+  if (!surname) {
+    return res.status(400).json({ error: "Surname is required." });
+  }
+
+  const current = readScheduleConfig();
+  if (!current.employee_schedules) {
+    current.employee_schedules = {};
+  }
+  const prevEmp = current.employee_schedules[surname] || { work_days: [1, 2, 3, 4, 5] };
+
+  if (clear) {
+    current.employee_schedules[surname] = {
+      ...prevEmp,
+      vacation_start: null,
+      vacation_end: null,
+    };
+    writeScheduleConfig(current);
+    addLogEntry("INFO", `VACATION_CLEARED: Cleared vacation status for ${surname}`);
+    return res.json({ success: true, schedule: current, employeeSchedule: current.employee_schedules[surname] });
+  }
+
+  let startStr = vacation_start;
+  let endStr = vacation_end;
+
+  if (days && !vacation_start) {
+    const { dateStr } = getAdjustedDate();
+    startStr = dateStr;
+    const sDate = new Date();
+    sDate.setDate(sDate.getDate() + Number(days));
+    const yyyy = sDate.getFullYear();
+    const mm = String(sDate.getMonth() + 1).padStart(2, '0');
+    const dd = String(sDate.getDate()).padStart(2, '0');
+    endStr = `${yyyy}-${mm}-${dd}`;
+  }
+
+  current.employee_schedules[surname] = {
+    ...prevEmp,
+    vacation_start: startStr || null,
+    vacation_end: endStr || null,
+  };
+
+  writeScheduleConfig(current);
+  addLogEntry("INFO", `VACATION_SET: Set vacation for ${surname} from ${startStr} to ${endStr}`);
+  res.json({ success: true, schedule: current, employeeSchedule: current.employee_schedules[surname] });
 });
 
 // Update Role
@@ -958,6 +1074,98 @@ app.delete("/api/roles/:surname", (req, res) => {
   writeRoles(roles);
   addLogEntry("WARNING", `ROLE_REMOVED: Unassigned role for ${surname}`);
   res.json({ success: true, roles });
+});
+
+// --- Backup & Restore Endpoints ---
+// Export Full System Backup (Users/Roles, Schedule/Vacations, and Shift Records)
+app.get("/api/backup/export", (req, res) => {
+  try {
+    const roles = readRoles();
+    const schedule = readScheduleConfig();
+    const records = readShiftRecords();
+    const backupData = {
+      version: "2.4",
+      exported_at: new Date().toISOString(),
+      roles,
+      schedule,
+      records_count: records.length,
+      records,
+    };
+
+    res.setHeader("Content-Disposition", `attachment; filename=shiftbot_backup_${new Date().toISOString().split("T")[0]}.json`);
+    res.setHeader("Content-Type", "application/json");
+    res.send(JSON.stringify(backupData, null, 2));
+  } catch (err: any) {
+    console.error("Backup export error:", err);
+    res.status(500).json({ error: "Failed to create backup: " + err.message });
+  }
+});
+
+// Import / Restore Full System Backup
+app.post("/api/backup/import", (req, res) => {
+  const { roles, schedule, records, overwrite_records } = req.body;
+
+  if (!roles && !schedule && !records) {
+    return res.status(400).json({ error: "Invalid backup data: missing roles, schedule, or records." });
+  }
+
+  try {
+    // 1. Restore Roles if provided
+    if (roles && typeof roles === "object") {
+      writeRoles(roles);
+    }
+
+    // 2. Restore Schedule if provided
+    if (schedule && typeof schedule === "object") {
+      writeScheduleConfig(schedule);
+    }
+
+    // 3. Restore Shift Records if requested
+    if (Array.isArray(records) && records.length > 0) {
+      if (overwrite_records) {
+        try {
+          execSql("DELETE FROM shift_records");
+        } catch (e) {}
+      }
+
+      // Insert or merge records into SQLite
+      for (const r of records) {
+        if (!r.surname || !r.action || !r.time) continue;
+        try {
+          execSql(
+            `INSERT OR IGNORE INTO shift_records (id, chat_id, telegram_user_id, action, surname, time, time_line, raw_text, source, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              r.id || Date.now() + Math.floor(Math.random() * 1000),
+              r.chat_id || 0,
+              r.telegram_user_id || null,
+              r.action,
+              r.surname,
+              r.time,
+              r.time_line || `Imported: ${r.time}`,
+              r.raw_text || "Restored from Backup",
+              r.source || "backup_import",
+              r.created_at || new Date().toISOString().replace("T", " ").substring(0, 19)
+            ]
+          );
+        } catch (e) {
+          console.error("Error inserting restored record:", e);
+        }
+      }
+    }
+
+    addLogEntry("INFO", "BACKUP_RESTORED: Successfully restored system data from JSON backup file.");
+    res.json({
+      success: true,
+      message: "Data restored successfully",
+      roles: readRoles(),
+      schedule: readScheduleConfig(),
+      records_count: readShiftRecords().length,
+    });
+  } catch (err: any) {
+    console.error("Backup import error:", err);
+    res.status(500).json({ error: "Failed to restore backup: " + err.message });
+  }
 });
 
 // Get Python Bot Code

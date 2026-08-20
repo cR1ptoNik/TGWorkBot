@@ -4,5 +4,6 @@
   "tz_offset_hours": 3,
   "remind_before_start_minutes": 5,
   "remind_after_end_minutes": 5,
-  "enabled": true
+  "enabled": true,
+  "employee_schedules": {}
 }

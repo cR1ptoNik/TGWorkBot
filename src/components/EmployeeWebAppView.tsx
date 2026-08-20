@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { Clock, ShieldAlert, CheckCircle2, Bot, Calendar, Sparkles, ArrowLeft } from 'lucide-react';
+import { Clock, ShieldAlert, CheckCircle2, Bot, Calendar, Sparkles, ArrowLeft, Palmtree, Coffee, Briefcase } from 'lucide-react';
 import { IndividualCharts } from './IndividualCharts';
+import { ScheduleConfig } from '../types';
 import { apiFetch } from '../lib/api';
 
 interface Props {
@@ -9,8 +10,19 @@ interface Props {
   role: string;
 }
 
+const DAY_NAMES: Record<number, string> = {
+  1: 'Пн',
+  2: 'Вт',
+  3: 'Ср',
+  4: 'Чт',
+  5: 'Пт',
+  6: 'Сб',
+  7: 'Вс',
+};
+
 export const EmployeeWebAppView: React.FC<Props> = ({ surname, telegramId, role }) => {
   const [todayRecord, setTodayRecord] = useState<{ inTime?: string; outTime?: string; status: string } | null>(null);
+  const [schedule, setSchedule] = useState<ScheduleConfig | null>(null);
 
   const handleCloseWebApp = () => {
     // @ts-ignore
@@ -21,6 +33,7 @@ export const EmployeeWebAppView: React.FC<Props> = ({ surname, telegramId, role 
   };
 
   useEffect(() => {
+    // Fetch stats & today status
     apiFetch(`/api/individual-stats?surname=${encodeURIComponent(surname)}`)
       .then((res) => res.json())
       .then((data) => {
@@ -33,7 +46,35 @@ export const EmployeeWebAppView: React.FC<Props> = ({ surname, telegramId, role 
         }
       })
       .catch((err) => console.error('Error fetching employee today status:', err));
+
+    // Fetch schedule
+    apiFetch('/api/schedule')
+      .then((res) => res.json())
+      .then((sData) => {
+        if (sData) setSchedule(sData);
+      })
+      .catch((err) => console.error('Error fetching schedule in webapp:', err));
   }, [surname]);
+
+  // Compute employee schedule & status
+  const empSchedule = schedule?.employee_schedules?.[surname] || { work_days: [1, 2, 3, 4, 5] };
+  const workDays = empSchedule.work_days || [1, 2, 3, 4, 5];
+  const vacStart = empSchedule.vacation_start;
+  const vacEnd = empSchedule.vacation_end;
+
+  const today = new Date();
+  const offset = typeof schedule?.tz_offset_hours === 'number' ? schedule.tz_offset_hours : 3;
+  const utc = today.getTime() + today.getTimezoneOffset() * 60000;
+  const localDate = new Date(utc + offset * 3600000);
+  const yyyy = localDate.getFullYear();
+  const mm = String(localDate.getMonth() + 1).padStart(2, '0');
+  const dd = String(localDate.getDate()).padStart(2, '0');
+  const todayDateStr = `${yyyy}-${mm}-${dd}`;
+  const jsDay = localDate.getDay();
+  const isoDay = jsDay === 0 ? 7 : jsDay;
+
+  const isVacation = Boolean(vacStart && vacEnd && vacStart <= todayDateStr && todayDateStr <= vacEnd);
+  const isWorkDay = workDays.includes(isoDay);
 
   return (
     <div className="max-w-4xl w-full mx-auto space-y-6 p-4 md:p-6">
@@ -62,7 +103,7 @@ export const EmployeeWebAppView: React.FC<Props> = ({ surname, telegramId, role 
               Привет, <span className="text-cyan-400">{surname || 'Сотрудник'}</span>! 👋
             </h1>
             <p className="text-xs text-slate-300 mt-1 whitespace-normal break-words">
-              Ваш личный кабинет учета рабочего времени и аналитики смен.
+              Ваш личный кабинет учета рабочего времени, графика и аналитики смен.
             </p>
           </div>
 
@@ -76,6 +117,73 @@ export const EmployeeWebAppView: React.FC<Props> = ({ surname, telegramId, role 
         </div>
       </div>
 
+      {/* Schedule & Vacation Status Overview Cards */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        {/* Work days & Schedule */}
+        <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-xs flex flex-col justify-between">
+          <div>
+            <div className="text-[10px] font-bold uppercase text-slate-400 tracking-wider flex items-center gap-1.5 mb-2">
+              <Calendar className="w-3.5 h-3.5 text-cyan-600" />
+              Ваш индивидуальный рабочий график
+            </div>
+            <div className="flex flex-wrap gap-1.5 my-2">
+              {[1, 2, 3, 4, 5, 6, 7].map((d) => {
+                const active = workDays.includes(d);
+                const isCurrent = d === isoDay;
+                return (
+                  <span
+                    key={d}
+                    className={`px-2.5 py-1 rounded text-xs font-bold ${
+                      active
+                        ? 'bg-cyan-100 text-cyan-900 border border-cyan-300'
+                        : 'bg-slate-100 text-slate-400'
+                    } ${isCurrent ? 'ring-2 ring-cyan-500' : ''}`}
+                  >
+                    {DAY_NAMES[d]}
+                  </span>
+                );
+              })}
+            </div>
+          </div>
+          <div className="text-xs text-slate-500 mt-2 font-medium">
+            Смена: <strong className="text-slate-800">{schedule?.shift_start || '09:00'} — {schedule?.shift_end || '18:00'}</strong> (UTC+{offset})
+          </div>
+        </div>
+
+        {/* Vacation & Today Status */}
+        <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-xs flex flex-col justify-between">
+          <div>
+            <div className="text-[10px] font-bold uppercase text-slate-400 tracking-wider flex items-center gap-1.5 mb-2">
+              <Palmtree className="w-3.5 h-3.5 text-amber-600" />
+              Статус на сегодня ({todayDateStr})
+            </div>
+            <div>
+              {isVacation ? (
+                <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-amber-100 text-amber-900 border border-amber-300 text-xs font-bold">
+                  <Palmtree className="w-4 h-4 text-amber-600 shrink-0" />
+                  <span>🏖 В отпуске с {vacStart} по {vacEnd}</span>
+                </div>
+              ) : isWorkDay ? (
+                <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-emerald-100 text-emerald-900 border border-emerald-300 text-xs font-bold">
+                  <Briefcase className="w-4 h-4 text-emerald-600 shrink-0" />
+                  <span>🟢 Рабочий день (Напоминания активны)</span>
+                </div>
+              ) : (
+                <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-100 text-slate-700 border border-slate-200 text-xs font-bold">
+                  <Coffee className="w-4 h-4 text-slate-500 shrink-0" />
+                  <span>☕️ Выходной день (Уведомления отключены)</span>
+                </div>
+              )}
+            </div>
+          </div>
+          <p className="text-[11px] text-slate-400 mt-2">
+            {isVacation || !isWorkDay
+              ? 'В этот день бот не будет беспокоить вас напоминаниями.'
+              : 'Не забудьте отправить скриншот прихода и ухода в чат.'}
+          </p>
+        </div>
+      </div>
+
       {/* Shift Status Card */}
       <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-xs flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
         <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3 min-w-0">
@@ -84,7 +192,7 @@ export const EmployeeWebAppView: React.FC<Props> = ({ surname, telegramId, role 
           </div>
           <div>
             <div className="text-[10px] font-bold uppercase text-slate-400 tracking-wider">
-              Статус смены на сегодня ({new Date().toISOString().split('T')[0]})
+              Отметки за сегодня ({todayDateStr})
             </div>
             <div className="text-sm font-bold text-slate-900 mt-0.5 flex flex-wrap items-center gap-2 break-words">
               {todayRecord?.inTime ? (
@@ -112,3 +220,4 @@ export const EmployeeWebAppView: React.FC<Props> = ({ surname, telegramId, role 
     </div>
   );
 };
+
